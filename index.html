@@ -61,7 +61,7 @@ function setStatus(msg,kind=''){statusEl.textContent=msg;statusEl.className=kind
 function signature(ctx,w,h){const d=ctx.getImageData(0,0,w,h).data; const cells=12; let out=[]; for(let cy=0;cy<cells;cy++)for(let cx=0;cx<cells;cx++){let sr=0,sg=0,sb=0,n=0; const x0=Math.floor(cx*w/cells),x1=Math.floor((cx+1)*w/cells),y0=Math.floor(cy*h/cells),y1=Math.floor((cy+1)*h/cells); for(let y=y0;y<y1;y+=3)for(let x=x0;x<x1;x+=3){let i=(y*w+x)*4;sr+=d[i];sg+=d[i+1];sb+=d[i+2];n++;} out.push([sr/n,sg/n,sb/n]);} return out;}
 function similarity(a,b){if(!a||!b)return 0;let e=0;for(let i=0;i<a.length;i++){let dr=a[i][0]-b[i][0],dg=a[i][1]-b[i][1],db=a[i][2]-b[i][2];e+=Math.sqrt(dr*dr+dg*dg+db*db)/441.67;} return Math.max(0,1-e/a.length);}
 function recognitionHit(sim){
-  if(sim>=0.50) matchFrames++; else matchFrames=0;
+  if(sim>=0.65) matchFrames++; else matchFrames=0;
   return matchFrames>=2;
 }
 document.getElementById('prepareBtn').addEventListener('click',()=>{const f=traceFile.files[0];if(!f){setStatus('Choose a trace photograph first.','warn');return;} const img=new Image();img.onload=()=>{rctx.clearRect(0,0,240,180);rctx.drawImage(img,0,0,240,180);refSig=signature(rctx,240,180);armed=true;found=false;overlay.innerHTML='';setStatus('Trace prepared. Start the camera and point it at the reference view.','ok');URL.revokeObjectURL(img.src)};img.src=URL.createObjectURL(f);});
