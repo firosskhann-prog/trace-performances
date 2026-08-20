@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>TRACE SIMPLE — Unit Test v5</title>
+  <title>TRACE SIMPLE — Unit Test v6</title>
   <style>
     :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#111;background:#f4f4f4}
     body{margin:0}.wrap{max-width:760px;margin:auto;padding:18px}.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:16px;margin:12px 0}
@@ -20,7 +20,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>TRACE SIMPLE — One Unit Test v5</h1>
+  <h1>TRACE SIMPLE — One Unit Test v6</h1>
   <div class="muted">Choose one trace photograph and one response. Then start the camera and point it at the same photograph/object view.</div>
 
   <div class="card">
@@ -121,7 +121,36 @@ function recognitionHit(m){
   if(good) matchFrames++; else matchFrames=0;
   return matchFrames>=3;
 }
-document.getElementById('prepareBtn').addEventListener('click',()=>{const f=traceFile.files[0];if(!f){setStatus('Choose a trace photograph first.','warn');return;} const img=new Image();img.onload=()=>{rctx.clearRect(0,0,240,180);rctx.drawImage(img,0,0,240,180);refSig=signature(rctx,240,180);armed=true;found=false;overlay.innerHTML='';setStatus('Trace prepared. Start the camera and point it at the reference view.','ok');URL.revokeObjectURL(img.src)};img.src=URL.createObjectURL(f);});
+async function prepareTrace(){
+  const f=traceFile.files[0];
+  if(!f){setStatus('Choose a trace photograph first.','warn');return;}
+  armed=false; found=false; matchFrames=0; overlay.innerHTML='';
+  setStatus('Preparing trace: '+f.name+' …');
+  try{
+    let source=null;
+    if('createImageBitmap' in window){
+      source=await createImageBitmap(f,{imageOrientation:'from-image'});
+    }else{
+      source=await new Promise((resolve,reject)=>{
+        const img=new Image();
+        const url=URL.createObjectURL(f);
+        img.onload=()=>{URL.revokeObjectURL(url);resolve(img);};
+        img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('Image decode failed'));};
+        img.src=url;
+      });
+    }
+    rctx.clearRect(0,0,240,180);
+    rctx.drawImage(source,0,0,240,180);
+    if(source.close) source.close();
+    refSig=signature(rctx,240,180);
+    armed=true;
+    setStatus('Trace prepared: '+f.name+'. Start the camera.','ok');
+  }catch(e){
+    refSig=null;
+    setStatus('Could not prepare this photo. Try a JPG or PNG image.','bad');
+  }
+}
+document.getElementById('prepareBtn').addEventListener('click',prepareTrace);
 async function showResponse(){if(found)return;found=true;overlay.innerHTML='';const t=responseType.value;if(t==='text'){const d=document.createElement('div');d.className='text';d.textContent=responseText.value||'TRACE FOUND';overlay.appendChild(d)}else{const f=mediaFile.files[0];if(!f){const d=document.createElement('div');d.className='text';d.textContent='TRACE FOUND — add a media file';overlay.appendChild(d);return;} if(mediaUrl)URL.revokeObjectURL(mediaUrl);mediaUrl=URL.createObjectURL(f); if(t==='audio'){const d=document.createElement('div');d.className='text';d.textContent='TRACE FOUND — AUDIO PLAYING';overlay.appendChild(d);const a=new Audio(mediaUrl);a.play().catch(()=>{});}else{const el=document.createElement(t==='video'?'video':'img');el.src=mediaUrl;if(t==='video'){el.autoplay=true;el.loop=true;el.muted=false;el.playsInline=true;el.controls=true;el.play().catch(()=>{});}overlay.appendChild(el)}} setStatus('TRACE FOUND.','ok');setTimeout(()=>{found=false;overlay.innerHTML='';},4000)}
 async function startCamera(){if(!armed){setStatus('Prepare the trace first.','warn');return;} try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});camera.srcObject=stream;await camera.play();setStatus('Camera running. Point at the trace photograph/object view.','ok');timer=setInterval(()=>{if(camera.readyState<2||found)return;lctx.drawImage(camera,0,0,240,180);const s=signature(lctx,240,180);const m=similarity(refSig,s);if(recognitionHit(m)){matchFrames=0;showResponse();}else statusEl.textContent='Scanning… match '+Math.round(m.score*100)+'% | structure '+Math.round(m.structure*100)+'% | edges '+Math.round(m.edges*100)+'%';},600);}catch(e){setStatus('Camera could not start. Open this page over HTTPS and allow camera permission.','bad')}}
 document.getElementById('startBtn').addEventListener('click',startCamera);document.getElementById('stopBtn').addEventListener('click',()=>{if(timer)clearInterval(timer);if(stream)stream.getTracks().forEach(t=>t.stop());camera.srcObject=null;setStatus('Camera stopped.');});
