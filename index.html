@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>TRACE SIMPLE — Unit Test</title>
+  <title>TRACE SIMPLE — Unit Test v5</title>
   <style>
     :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#111;background:#f4f4f4}
     body{margin:0}.wrap{max-width:760px;margin:auto;padding:18px}.card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:16px;margin:12px 0}
@@ -20,7 +20,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>TRACE SIMPLE — One Unit Test</h1>
+  <h1>TRACE SIMPLE — One Unit Test v5</h1>
   <div class="muted">Choose one trace photograph and one response. Then start the camera and point it at the same photograph/object view.</div>
 
   <div class="card">
@@ -58,15 +58,72 @@ const refCanvas=document.getElementById('refCanvas'), liveCanvas=document.getEle
 let refSig=null,stream=null,timer=null,mediaUrl=null,armed=false,found=false,matchFrames=0;
 responseType.addEventListener('change',()=>{const t=responseType.value;textField.style.display=t==='text'?'block':'none';mediaField.style.display=t==='text'?'none':'block';}); responseType.dispatchEvent(new Event('change'));
 function setStatus(msg,kind=''){statusEl.textContent=msg;statusEl.className=kind;}
-function signature(ctx,w,h){const d=ctx.getImageData(0,0,w,h).data; const cells=12; let out=[]; for(let cy=0;cy<cells;cy++)for(let cx=0;cx<cells;cx++){let sr=0,sg=0,sb=0,n=0; const x0=Math.floor(cx*w/cells),x1=Math.floor((cx+1)*w/cells),y0=Math.floor(cy*h/cells),y1=Math.floor((cy+1)*h/cells); for(let y=y0;y<y1;y+=3)for(let x=x0;x<x1;x+=3){let i=(y*w+x)*4;sr+=d[i];sg+=d[i+1];sb+=d[i+2];n++;} out.push([sr/n,sg/n,sb/n]);} return out;}
-function similarity(a,b){if(!a||!b)return 0;let e=0;for(let i=0;i<a.length;i++){let dr=a[i][0]-b[i][0],dg=a[i][1]-b[i][1],db=a[i][2]-b[i][2];e+=Math.sqrt(dr*dr+dg*dg+db*db)/441.67;} return Math.max(0,1-e/a.length);}
-function recognitionHit(sim){
-  if(sim>=0.65) matchFrames++; else matchFrames=0;
-  return matchFrames>=2;
+function signature(ctx,w,h){
+  const d=ctx.getImageData(0,0,w,h).data;
+  const cols=16, rows=12;
+  const gray=[], color=[];
+  for(let cy=0;cy<rows;cy++){
+    for(let cx=0;cx<cols;cx++){
+      let sr=0,sg=0,sb=0,n=0;
+      const x0=Math.floor(cx*w/cols),x1=Math.floor((cx+1)*w/cols);
+      const y0=Math.floor(cy*h/rows),y1=Math.floor((cy+1)*h/rows);
+      for(let y=y0;y<y1;y+=3){
+        for(let x=x0;x<x1;x+=3){
+          const i=(y*w+x)*4;
+          sr+=d[i]; sg+=d[i+1]; sb+=d[i+2]; n++;
+        }
+      }
+      const r=sr/n,g=sg/n,b=sb/n;
+      color.push([r,g,b]);
+      gray.push(0.299*r+0.587*g+0.114*b);
+    }
+  }
+  const mean=gray.reduce((a,v)=>a+v,0)/gray.length;
+  const centered=gray.map(v=>v-mean);
+  const norm=Math.sqrt(centered.reduce((a,v)=>a+v*v,0))||1;
+  const normalized=centered.map(v=>v/norm);
+  const edges=[];
+  for(let y=0;y<rows;y++){
+    for(let x=0;x<cols;x++){
+      const i=y*cols+x;
+      const gx=x<cols-1?gray[i+1]-gray[i]:0;
+      const gy=y<rows-1?gray[i+cols]-gray[i]:0;
+      edges.push(Math.sqrt(gx*gx+gy*gy));
+    }
+  }
+  const edgeMean=edges.reduce((a,v)=>a+v,0)/edges.length;
+  const edgeCentered=edges.map(v=>v-edgeMean);
+  const edgeNorm=Math.sqrt(edgeCentered.reduce((a,v)=>a+v*v,0))||1;
+  const edgeNormalized=edgeCentered.map(v=>v/edgeNorm);
+  return {color, normalized, edgeNormalized};
+}
+function dot(a,b){let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s;}
+function colorSimilarity(a,b){
+  let e=0;
+  for(let i=0;i<a.length;i++){
+    const dr=a[i][0]-b[i][0],dg=a[i][1]-b[i][1],db=a[i][2]-b[i][2];
+    e+=Math.sqrt(dr*dr+dg*dg+db*db)/441.67;
+  }
+  return Math.max(0,1-e/a.length);
+}
+function similarity(a,b){
+  if(!a||!b)return {score:0,structure:0,edges:0,color:0};
+  const structure=Math.max(0,dot(a.normalized,b.normalized));
+  const edges=Math.max(0,dot(a.edgeNormalized,b.edgeNormalized));
+  const color=colorSimilarity(a.color,b.color);
+  // Structure is the dominant signal; colour only assists.
+  const score=0.55*structure+0.30*edges+0.15*color;
+  return {score,structure,edges,color};
+}
+function recognitionHit(m){
+  // Require both overall similarity and real structural agreement.
+  const good=m.score>=0.70 && m.structure>=0.68 && m.edges>=0.45;
+  if(good) matchFrames++; else matchFrames=0;
+  return matchFrames>=3;
 }
 document.getElementById('prepareBtn').addEventListener('click',()=>{const f=traceFile.files[0];if(!f){setStatus('Choose a trace photograph first.','warn');return;} const img=new Image();img.onload=()=>{rctx.clearRect(0,0,240,180);rctx.drawImage(img,0,0,240,180);refSig=signature(rctx,240,180);armed=true;found=false;overlay.innerHTML='';setStatus('Trace prepared. Start the camera and point it at the reference view.','ok');URL.revokeObjectURL(img.src)};img.src=URL.createObjectURL(f);});
 async function showResponse(){if(found)return;found=true;overlay.innerHTML='';const t=responseType.value;if(t==='text'){const d=document.createElement('div');d.className='text';d.textContent=responseText.value||'TRACE FOUND';overlay.appendChild(d)}else{const f=mediaFile.files[0];if(!f){const d=document.createElement('div');d.className='text';d.textContent='TRACE FOUND — add a media file';overlay.appendChild(d);return;} if(mediaUrl)URL.revokeObjectURL(mediaUrl);mediaUrl=URL.createObjectURL(f); if(t==='audio'){const d=document.createElement('div');d.className='text';d.textContent='TRACE FOUND — AUDIO PLAYING';overlay.appendChild(d);const a=new Audio(mediaUrl);a.play().catch(()=>{});}else{const el=document.createElement(t==='video'?'video':'img');el.src=mediaUrl;if(t==='video'){el.autoplay=true;el.loop=true;el.muted=false;el.playsInline=true;el.controls=true;el.play().catch(()=>{});}overlay.appendChild(el)}} setStatus('TRACE FOUND.','ok');setTimeout(()=>{found=false;overlay.innerHTML='';},4000)}
-async function startCamera(){if(!armed){setStatus('Prepare the trace first.','warn');return;} try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});camera.srcObject=stream;await camera.play();setStatus('Camera running. Point at the trace photograph/object view.','ok');timer=setInterval(()=>{if(camera.readyState<2||found)return;lctx.drawImage(camera,0,0,240,180);const s=signature(lctx,240,180);const sim=similarity(refSig,s);if(recognitionHit(sim)){matchFrames=0;showResponse();}else statusEl.textContent='Scanning… similarity '+Math.round(sim*100)+'% — hold steady';},600);}catch(e){setStatus('Camera could not start. Open this page over HTTPS and allow camera permission.','bad')}}
+async function startCamera(){if(!armed){setStatus('Prepare the trace first.','warn');return;} try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});camera.srcObject=stream;await camera.play();setStatus('Camera running. Point at the trace photograph/object view.','ok');timer=setInterval(()=>{if(camera.readyState<2||found)return;lctx.drawImage(camera,0,0,240,180);const s=signature(lctx,240,180);const m=similarity(refSig,s);if(recognitionHit(m)){matchFrames=0;showResponse();}else statusEl.textContent='Scanning… match '+Math.round(m.score*100)+'% | structure '+Math.round(m.structure*100)+'% | edges '+Math.round(m.edges*100)+'%';},600);}catch(e){setStatus('Camera could not start. Open this page over HTTPS and allow camera permission.','bad')}}
 document.getElementById('startBtn').addEventListener('click',startCamera);document.getElementById('stopBtn').addEventListener('click',()=>{if(timer)clearInterval(timer);if(stream)stream.getTracks().forEach(t=>t.stop());camera.srcObject=null;setStatus('Camera stopped.');});
 document.getElementById('shareBtn').addEventListener('click',()=>{const url=location.href.split('#')[0];document.getElementById('generatedLink').textContent=url;if(window.QRCode){QRCode.toCanvas(document.getElementById('qr'),url,{width:220,margin:1},()=>{});}else{setStatus('QR library did not load, but the link above is usable.','warn')}});
 </script>
