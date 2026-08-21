@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>TRACE — Make MindAR Target</title>
+  <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js"></script>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f5f5f5;color:#111}
+    main{max-width:680px;margin:auto;padding:22px}
+    .card{background:white;border:1px solid #ddd;border-radius:16px;padding:20px}
+    img{display:block;max-width:100%;max-height:280px;margin:14px auto;border-radius:10px}
+    button,a.button{display:inline-block;border:0;border-radius:12px;background:#111;color:white;padding:13px 18px;font:inherit;text-decoration:none;cursor:pointer}
+    button:disabled{opacity:.45;cursor:wait}
+    #download{display:none;margin-left:8px}
+    #status{margin:14px 0;padding:11px;border-radius:10px;background:#eee}
+    small{color:#666}
+  </style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>Make TRACE target</h1>
+    <p>This page already knows your target: <strong>NEON</strong>. Press one button. Nothing else to select.</p>
+    <img id="preview" src="./target-neon.png" alt="NEON target image" />
+    <div>
+      <button id="compile" type="button">MAKE targets.mind</button>
+      <a id="download" class="button" download="targets.mind">DOWNLOAD targets.mind</a>
+    </div>
+    <div id="status">Ready.</div>
+    <small>After downloading, upload <b>targets.mind</b> to the root of the same GitHub repository, beside index.html.</small>
+  </div>
+</main>
+<script>
+  const button = document.querySelector('#compile');
+  const download = document.querySelector('#download');
+  const status = document.querySelector('#status');
+
+  const loadTarget = () => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not load target-neon.png'));
+    img.src = './target-neon.png?v=' + Date.now();
+  });
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    download.style.display = 'none';
+    status.textContent = 'Loading target…';
+    try {
+      if (!window.MINDAR || !window.MINDAR.IMAGE || !window.MINDAR.IMAGE.Compiler) {
+        throw new Error('MindAR compiler did not load. Check internet connection.');
+      }
+      const image = await loadTarget();
+      const compiler = new window.MINDAR.IMAGE.Compiler();
+      status.textContent = 'Compiling…';
+      await compiler.compileImageTargets([image], progress => {
+        status.textContent = 'Compiling… ' + Number(progress).toFixed(0) + '%';
+      });
+      const buffer = await compiler.exportData();
+      const blob = new Blob([buffer], {type:'application/octet-stream'});
+      const url = URL.createObjectURL(blob);
+      download.href = url;
+      download.style.display = 'inline-block';
+      status.textContent = 'Ready. Press DOWNLOAD targets.mind.';
+    } catch (err) {
+      console.error(err);
+      status.textContent = 'ERROR: ' + err.message;
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
