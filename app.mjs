@@ -14,9 +14,9 @@ const FRAME_INTERVAL_MS = 220;
 
 // Strong-recognition requirements.
 const RECOGNITION_RULES = {
-  minMatches: 20,
+  minMatches: 60,
   minInliers: 15,
-  minInlierRatio: 0.45
+  minInlierRatio: 0.10
 };
 
 const $ = (id) => document.getElementById(id);
