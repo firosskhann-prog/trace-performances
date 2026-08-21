@@ -2,75 +2,155 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>TRACE — MindAR Test</title>
-  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#111111" />
+  <title>Trace → Sound Test</title>
   <style>
-    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-    #ui{position:fixed;inset:0;z-index:9999;pointer-events:none;color:#fff}
-    #top{position:absolute;top:max(16px,env(safe-area-inset-top));left:16px;right:16px;display:flex;justify-content:center}
-    #status{background:rgba(0,0,0,.68);padding:10px 14px;border-radius:999px;font-size:15px;text-align:center}
-    #startWrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#000;pointer-events:auto}
-    #start{border:0;border-radius:14px;background:#fff;color:#111;padding:15px 22px;font-size:18px;font-weight:650}
-    #hint{position:absolute;bottom:max(20px,env(safe-area-inset-bottom));left:20px;right:20px;text-align:center;font-size:14px;background:rgba(0,0,0,.58);padding:10px;border-radius:12px}
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #f4f4f4;
+    }
+    main { width: min(760px, 100%); margin: 0 auto; padding: 18px; }
+    h1 { font-size: 1.35rem; margin: 0 0 6px; }
+    .sub { margin: 0 0 18px; color: #bdbdbd; line-height: 1.4; }
+    .setup {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .pick {
+      display: flex;
+      min-height: 52px;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      border: 1px solid #555;
+      border-radius: 12px;
+      background: #222;
+      padding: 10px;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    .pick input { display: none; }
+    .picked { border-color: #999; background: #2b2b2b; }
+    #startBtn {
+      width: 100%;
+      min-height: 56px;
+      border: 0;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 800;
+      background: #f0f0f0;
+      color: #111;
+      cursor: pointer;
+    }
+    #startBtn:disabled { opacity: 0.35; cursor: not-allowed; }
+    #cameraBox {
+      position: relative;
+      margin-top: 14px;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      overflow: hidden;
+      border: 6px solid #333;
+      border-radius: 14px;
+      background: #000;
+      transition: border-color 100ms linear, box-shadow 100ms linear;
+    }
+    #cameraBox.found {
+      border-color: red;
+      box-shadow: inset 0 0 0 3px red;
+    }
+    #cameraCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: cover;
+      background: #000;
+    }
+    #foundBadge {
+      display: none;
+      position: absolute;
+      left: 50%;
+      top: 18px;
+      transform: translateX(-50%);
+      background: red;
+      color: white;
+      font-weight: 900;
+      letter-spacing: .08em;
+      padding: 9px 14px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    #cameraBox.found #foundBadge { display: block; }
+    #status {
+      margin-top: 12px;
+      min-height: 24px;
+      font-weight: 650;
+    }
+    #details { margin-top: 4px; color: #a7a7a7; font-size: .9rem; }
+    #stopBtn {
+      display: none;
+      margin-top: 12px;
+      width: 100%;
+      min-height: 46px;
+      border: 1px solid #555;
+      border-radius: 10px;
+      background: transparent;
+      color: #eee;
+      font-weight: 700;
+    }
+    #referencePreview {
+      display: none;
+      max-width: 110px;
+      max-height: 110px;
+      margin-top: 12px;
+      border-radius: 8px;
+      border: 1px solid #444;
+    }
+    video, #patternCanvas { display: none; }
+    @media (max-width: 460px) {
+      main { padding: 12px; }
+      .setup { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <div id="ui">
-    <div id="top"><div id="status">Ready</div></div>
-    <div id="startWrap"><button id="start" type="button">START TRACE</button></div>
-    <div id="hint">Point the camera at the NEON target image.</div>
-  </div>
+  <main>
+    <h1>Trace → Sound Test</h1>
+    <p class="sub">Choose one trace image and one sound. Press START, then point the rear camera at that trace.</p>
 
-  <a-scene
-    id="scene"
-    mindar-image="imageTargetSrc: ./targets.mind; autoStart: false; uiLoading: no; uiScanning: no; uiError: no;"
-    color-space="sRGB"
-    renderer="colorManagement: true, physicallyCorrectLights"
-    vr-mode-ui="enabled: false"
-    device-orientation-permission-ui="enabled: false"
-    embedded>
+    <div class="setup">
+      <label class="pick" id="traceLabel">1. CHOOSE TRACE IMAGE
+        <input id="traceInput" type="file" accept="image/*" />
+      </label>
+      <label class="pick" id="soundLabel">2. CHOOSE SOUND
+        <input id="soundInput" type="file" accept="audio/*" />
+      </label>
+    </div>
 
-    <a-assets>
-      <img id="moon" src="./response-moon.jpg" alt="Moon response image" />
-    </a-assets>
+    <button id="startBtn" type="button" disabled>START CAMERA + SOUND</button>
 
-    <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
+    <img id="referencePreview" alt="Selected trace preview" />
 
-    <a-entity id="target" mindar-image-target="targetIndex: 0">
-      <a-plane src="#moon" position="0 0 0.02" width="1" height="1" material="shader: flat; transparent: true"></a-plane>
-    </a-entity>
-  </a-scene>
+    <div id="cameraBox">
+      <canvas id="cameraCanvas" width="480" height="360"></canvas>
+      <div id="foundBadge">TRACE FOUND</div>
+    </div>
 
-  <script>
-    const scene = document.querySelector('#scene');
-    const target = document.querySelector('#target');
-    const start = document.querySelector('#start');
-    const startWrap = document.querySelector('#startWrap');
-    const status = document.querySelector('#status');
+    <div id="status" role="status" aria-live="polite">Loading recognition engine…</div>
+    <div id="details"></div>
+    <button id="stopBtn" type="button">STOP CAMERA</button>
 
-    const setStatus = (text) => { status.textContent = text; };
+    <video id="cameraVideo" playsinline muted></video>
+    <canvas id="patternCanvas"></canvas>
+  </main>
 
-    target.addEventListener('targetFound', () => setStatus('TRACE FOUND'));
-    target.addEventListener('targetLost', () => setStatus('Scanning…'));
-
-    start.addEventListener('click', async () => {
-      start.disabled = true;
-      setStatus('Starting camera…');
-      try {
-        if (!scene.hasLoaded) {
-          await new Promise(resolve => scene.addEventListener('loaded', resolve, {once:true}));
-        }
-        await scene.systems['mindar-image-system'].start();
-        startWrap.style.display = 'none';
-        setStatus('Scanning…');
-      } catch (err) {
-        console.error(err);
-        start.disabled = false;
-        setStatus('Could not start. Check camera permission and targets.mind.');
-      }
-    });
-  </script>
+  <script src="https://cdn.jsdelivr.net/gh/webarkit/jsfeatNext@0.13.0/dist/jsfeatNext.js"></script>
+  <script type="module" src="./app.mjs"></script>
 </body>
 </html>
