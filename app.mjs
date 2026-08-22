@@ -1,20 +1,20 @@
 const TRACE_CONFIG = [
   {
     id: 1,
-    image: './traces/trace1.jpg',
-    sound: './sounds/sound1.mp3',
+    image: './trace 1.jpg',
+    sound: './sound 1.mp3',
     threshold: 15
   },
   {
     id: 2,
-    image: './traces/trace2.jpg',
-    sound: './sounds/sound2.mp3',
+    image: './trace 2.jpg',
+    sound: './sound 2.wav',
     threshold: 15
   },
   {
     id: 3,
-    image: './traces/trace3.jpg',
-    sound: './sounds/sound3.mp3',
+    image: './trace 3.jpg',
+    sound: './sound 3.mp3',
     threshold: 15
   }
 ];
