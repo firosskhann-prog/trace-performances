@@ -1,201 +1,611 @@
-export function clampThreshold(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return 15;
-  return Math.max(4, Math.min(100, Math.round(n)));
-}
-
-export function chooseWinningTrace(readings, blockedTraceId = null) {
-  const eligible = readings.filter((r) =>
-    r.ready &&
-    r.id !== blockedTraceId &&
-    r.goodMatches >= r.threshold
-  );
-
-  if (!eligible.length) return null;
-
-  eligible.sort((a, b) => {
-    const aScore = a.goodMatches / Math.max(1, a.threshold);
-    const bScore = b.goodMatches / Math.max(1, b.threshold);
-
-    if (bScore !== aScore) return bScore - aScore;
-
-    return b.goodMatches - a.goodMatches;
-  });
-
-  return eligible[0];
-}
-
-export function shouldReleaseBlockedTrace({
-  goodMatches,
-  threshold,
-  clearFrames,
-  framesNeeded = 3,
-}) {
-  const clearLevel = Math.max(
-    4,
-    Math.floor(threshold * 0.6)
-  );
-
-  if (goodMatches < clearLevel) {
-    const next = clearFrames + 1;
-
-    if (next >= framesNeeded) {
-      return {
-        release: true,
-        clearFrames: 0
-      };
-    }
-
-    return {
-      release: false,
-      clearFrames: next
-    };
+const TRACE_CONFIG = [
+  {
+    id: 1,
+    image: './traces/trace1.jpg',
+    sound: './sounds/sound1.mp3',
+    threshold: 15
+  },
+  {
+    id: 2,
+    image: './traces/trace2.jpg',
+    sound: './sounds/sound2.mp3',
+    threshold: 15
+  },
+  {
+    id: 3,
+    image: './traces/trace3.jpg',
+    sound: './sounds/sound3.mp3',
+    threshold: 15
   }
+];
 
-  return {
-    release: false,
-    clearFrames: 0
-  };
-}
+const W = 480;
+const H = 360;
 
-if (typeof document !== 'undefined') {
-  initApp();
-}
+const MAX_SCREEN_POINTS = 520;
+const CORNER_POOL = 8000;
 
-function ensureThreeTraceUI() {
+const MAX_PATTERN_SIZE = 512;
+const MAX_PATTERN_POINTS = 300;
+
+const TRAIN_LEVELS = 4;
+
+const MATCH_THRESHOLD = 50;
+const FRAME_INTERVAL_MS = 320;
+
+const PAGE_PARAMS =
+  new URLSearchParams(
+    window.location.search
+  );
+
+const AUDIENCE_MODE =
+  PAGE_PARAMS.get('audience') === '1';
+
+for (const cfg of TRACE_CONFIG) {
+
+  const supplied =
+    Number(
+      PAGE_PARAMS.get(
+        `t${cfg.id}`
+      )
+    );
 
   if (
-    document.getElementById(
-      'traceImage1'
-    )
+    Number.isFinite(supplied) &&
+    supplied >= 4 &&
+    supplied <= 100
   ) {
-    return;
+
+    cfg.threshold =
+      Math.round(supplied);
   }
+}
+
+const $ = (id) =>
+  document.getElementById(id);
+
+let jsfeat = null;
+
+let stream = null;
+let timer = null;
+let processing = false;
+
+let audioContext = null;
+let currentSource = null;
+
+let isAudioPlaying = false;
+
+let blockedTraceId = null;
+let blockedClearFrames = 0;
+
+let exposure = 0;
+
+let imgU8 = null;
+let imgSmooth = null;
+
+let screenCorners = null;
+let screenDescriptors = null;
+
+let matchScratch = [];
+
+const traces =
+  TRACE_CONFIG.map(
+    (cfg) => ({
+
+      ...cfg,
+
+      ready: false,
+
+      imageReady: false,
+      soundReady: false,
+
+      featureCount: 0,
+
+      audioBuffer: null,
+
+      patternCorners: [],
+
+      patternDescriptors: [],
+
+      patternBaseWidth: 0,
+      patternBaseHeight: 0,
+
+      homo3x3: null,
+      matchMask: null,
+
+      lastGoodMatches: 0,
+      lastCandidateMatches: 0
+
+    })
+  );
+
+function clamp(
+  value,
+  min,
+  max
+) {
+
+  const n =
+    Number(value);
+
+  if (
+    !Number.isFinite(n)
+  ) {
+
+    return min;
+  }
+
+  return Math.max(
+    min,
+    Math.min(
+      max,
+      n
+    )
+  );
+}
+
+function buildUI() {
 
   const style =
     document.createElement(
       'style'
     );
 
-  style.id =
-    'trace3-app-style';
-
   style.textContent = `
 
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #111;
+      color: #f3f3f3;
+
+      font-family:
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+    }
+
     main {
-      width: min(820px, 100%);
-      margin: 0 auto;
-      padding: 14px;
+
+      width:
+        min(
+          820px,
+          100%
+        );
+
+      margin:
+        0 auto;
+
+      padding:
+        14px;
     }
 
-    .trace3-sub {
-      margin: 0 0 14px;
-      color: #bdbdbd;
-      line-height: 1.4;
+    h1 {
+
+      font-size:
+        1.35rem;
+
+      margin:
+        0 0 6px;
     }
 
-    .trace3-card {
-      border: 1px solid #3f3f3f;
-      border-radius: 12px;
-      padding: 11px;
-      margin-bottom: 10px;
-      background: #1d1d1d;
+    .sub {
+
+      margin:
+        0 0 14px;
+
+      color:
+        #bdbdbd;
+
+      line-height:
+        1.4;
     }
 
-    .trace3-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      margin-bottom: 9px;
-    }
+    .toolbar {
 
-    .trace3-name {
-      font-weight: 850;
-    }
+      display:
+        grid;
 
-    .trace3-info {
-      color: #aaa;
-      font-size: .82rem;
-      text-align: right;
-    }
-
-    .trace3-controls {
-      display: grid;
       grid-template-columns:
-        1fr 1fr 110px;
-      gap: 8px;
-      align-items: stretch;
+        1fr auto;
+
+      gap:
+        10px;
+
+      align-items:
+        end;
+
+      margin:
+        10px 0 12px;
     }
 
-    .trace3-pick,
-    .trace3-threshold {
-      min-height: 48px;
-      border: 1px solid #555;
-      border-radius: 10px;
-      background: #252525;
+    .exposure {
+
+      border:
+        1px solid #444;
+
+      border-radius:
+        12px;
+
+      padding:
+        10px 12px;
+
+      background:
+        #1d1d1d;
     }
 
-    .trace3-pick {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-      padding: 8px;
-      cursor: pointer;
-      font-weight: 700;
+    .exposure-top {
+
+      display:
+        flex;
+
+      justify-content:
+        space-between;
+
+      gap:
+        10px;
+
+      margin-bottom:
+        6px;
     }
 
-    .trace3-pick input {
-      display: none;
+    .exposure label {
+
+      font-weight:
+        800;
     }
 
-    .trace3-pick.ready {
-      border-color: #999;
-      background: #303030;
+    .exposure span {
+
+      color:
+        #bbb;
+
+      font-variant-numeric:
+        tabular-nums;
     }
 
-    .trace3-threshold {
-      padding: 5px 8px;
+    .exposure input {
+
+      width:
+        100%;
+
+      min-height:
+        32px;
     }
 
-    .trace3-threshold label {
-      display: block;
-      color: #aaa;
-      font-size: .7rem;
-      margin-bottom: 2px;
+    button {
+
+      min-height:
+        48px;
+
+      border-radius:
+        11px;
+
+      border:
+        1px solid #555;
+
+      font-weight:
+        800;
+
+      font-size:
+        .96rem;
+
+      padding:
+        10px 14px;
+
+      cursor:
+        pointer;
     }
 
-    .trace3-threshold input {
-      width: 100%;
-      border: 0;
-      outline: 0;
-      background: transparent;
-      color: white;
-      font-size: 1rem;
-      font-weight: 800;
+    #shareBtn {
+
+      background:
+        #262626;
+
+      color:
+        white;
+    }
+
+    #startBtn {
+
+      width:
+        100%;
+
+      min-height:
+        56px;
+
+      border:
+        0;
+
+      background:
+        #f0f0f0;
+
+      color:
+        #111;
+
+      margin-bottom:
+        12px;
+    }
+
+    #startBtn:disabled {
+
+      opacity:
+        .35;
+
+      cursor:
+        not-allowed;
+    }
+
+    #cameraBox {
+
+      position:
+        relative;
+
+      width:
+        100%;
+
+      aspect-ratio:
+        4 / 3;
+
+      overflow:
+        hidden;
+
+      border:
+        6px solid #333;
+
+      border-radius:
+        14px;
+
+      background:
+        black;
+
+      transition:
+        border-color 100ms linear,
+        box-shadow 100ms linear;
+    }
+
+    #cameraBox.found {
+
+      border-color:
+        red;
+
+      box-shadow:
+        inset 0 0 0 3px red;
+    }
+
+    #cameraCanvas {
+
+      width:
+        100%;
+
+      height:
+        100%;
+
+      display:
+        block;
+
+      background:
+        black;
+    }
+
+    #foundBadge {
+
+      display:
+        none;
+
+      position:
+        absolute;
+
+      left:
+        50%;
+
+      top:
+        16px;
+
+      transform:
+        translateX(-50%);
+
+      background:
+        red;
+
+      color:
+        white;
+
+      font-weight:
+        900;
+
+      padding:
+        9px 14px;
+
+      border-radius:
+        999px;
+
+      white-space:
+        nowrap;
+    }
+
+    #cameraBox.found
+    #foundBadge {
+
+      display:
+        block;
+    }
+
+    #status {
+
+      margin-top:
+        12px;
+
+      min-height:
+        24px;
+
+      font-weight:
+        750;
+    }
+
+    #details {
+
+      margin-top:
+        4px;
+
+      color:
+        #aaa;
+
+      font-size:
+        .9rem;
     }
 
     #liveReadings {
-      margin-top: 9px;
-      padding: 9px 10px;
-      border-radius: 9px;
-      background: #1c1c1c;
-      color: #ccc;
-      font-size: .88rem;
-      line-height: 1.5;
+
+      margin-top:
+        9px;
+
+      padding:
+        9px 10px;
+
+      border-radius:
+        9px;
+
+      background:
+        #1c1c1c;
+
+      color:
+        #ccc;
+
+      font-size:
+        .86rem;
+
+      line-height:
+        1.45;
     }
 
-    @media (max-width: 580px) {
+    #stopBtn {
 
-      .trace3-controls {
+      display:
+        none;
+
+      width:
+        100%;
+
+      margin-top:
+        12px;
+
+      background:
+        transparent;
+
+      color:
+        #eee;
+    }
+
+    .readyLine {
+
+      margin:
+        10px 0;
+
+      color:
+        #bbb;
+
+      font-size:
+        .88rem;
+    }
+
+    .thresholds {
+
+      display:
+        grid;
+
+      grid-template-columns:
+        repeat(
+          3,
+          1fr
+        );
+
+      gap:
+        8px;
+
+      margin:
+        10px 0;
+    }
+
+    .thresholdBox {
+
+      border:
+        1px solid #444;
+
+      border-radius:
+        10px;
+
+      padding:
+        8px 10px;
+
+      background:
+        #1d1d1d;
+    }
+
+    .thresholdBox label {
+
+      display:
+        block;
+
+      color:
+        #aaa;
+
+      font-size:
+        .72rem;
+
+      margin-bottom:
+        3px;
+    }
+
+    .thresholdBox input {
+
+      width:
+        100%;
+
+      min-height:
+        38px;
+
+      border:
+        0;
+
+      border-radius:
+        7px;
+
+      background:
+        #292929;
+
+      color:
+        white;
+
+      font-size:
+        1rem;
+
+      font-weight:
+        800;
+
+      padding:
+        6px 8px;
+    }
+
+    @media
+    (max-width: 540px) {
+
+      .toolbar {
+
         grid-template-columns:
-          1fr 1fr;
+          1fr;
       }
 
-      .trace3-threshold {
-        grid-column:
-          1 / -1;
+      .thresholds {
+
+        grid-template-columns:
+          1fr;
       }
     }
 
@@ -205,98 +615,126 @@ function ensureThreeTraceUI() {
     style
   );
 
-  const main =
+  let main =
     document.querySelector(
       'main'
-    ) ||
-    document.body.appendChild(
+    );
+
+  if (!main) {
+
+    main =
       document.createElement(
         'main'
-      )
+      );
+
+    document.body.appendChild(
+      main
     );
+  }
 
   main.innerHTML = `
 
     <h1>
-      3 Trace → 3 Sound Test
+      Trace → Sound
     </h1>
 
-    <p class="trace3-sub">
-      Each trace has its own
-      geometric trigger.
-      Start at 15 and tune it
-      from the live readings.
+    <p class="sub">
+
+      Point the camera at any
+      prepared trace.
+
+      Its sound plays.
+
+      When the sound ends,
+      move away briefly and
+      you can return to that
+      trace again any time.
+
     </p>
 
-    ${[1, 2, 3].map((id) => `
+    <div class="toolbar">
 
-      <section class="trace3-card">
+      <div class="exposure">
 
-        <div class="trace3-head">
+        <div class="exposure-top">
 
-          <div class="trace3-name">
-            TRACE ${id}
-          </div>
+          <label
+            for="exposureSlider">
 
-          <div
-            class="trace3-info"
-            id="traceInfo${id}">
-            Not prepared
-          </div>
+            EXPOSURE
+
+          </label>
+
+          <span
+            id="exposureValue">
+
+            0
+
+          </span>
 
         </div>
 
-        <div class="trace3-controls">
+        <input
+          id="exposureSlider"
+          type="range"
+          min="-30"
+          max="30"
+          step="1"
+          value="0"
+          aria-label="Exposure adjustment">
 
-          <label
-            class="trace3-pick"
-            id="imageLabel${id}">
+      </div>
 
-            CHOOSE IMAGE
+      <button
+        id="shareBtn"
+        type="button">
 
-            <input
-              id="traceImage${id}"
-              type="file"
-              accept="image/*">
+        SHARE AUDIENCE LINK
 
-          </label>
+      </button>
 
-          <label
-            class="trace3-pick"
-            id="soundLabel${id}">
+    </div>
 
-            CHOOSE SOUND
+    <div
+      id="thresholdPanel"
+      class="thresholds">
 
-            <input
-              id="traceSound${id}"
-              type="file"
-              accept="audio/*">
+      ${TRACE_CONFIG.map(
+        (cfg) => `
 
-          </label>
-
-          <div
-            class="trace3-threshold">
+          <div class="thresholdBox">
 
             <label
-              for="traceThreshold${id}">
-              GEOMETRIC TRIGGER
+              for="threshold${cfg.id}">
+
+              TRACE ${cfg.id}
+              TRIGGER
+
             </label>
 
             <input
-              id="traceThreshold${id}"
+              id="threshold${cfg.id}"
               type="number"
               min="4"
               max="100"
               step="1"
-              value="15">
+              value="${cfg.threshold}">
 
           </div>
 
-        </div>
+        `
+      ).join('')}
 
-      </section>
+    </div>
 
-    `).join('')}
+    <div
+      id="readyLine"
+      class="readyLine">
+
+      Loading traces
+      and sounds…
+
+    </div>
 
     <button
       id="startBtn"
@@ -316,7 +754,9 @@ function ensureThreeTraceUI() {
       </canvas>
 
       <div id="foundBadge">
+
         TRACE FOUND
+
       </div>
 
     </div>
@@ -326,7 +766,8 @@ function ensureThreeTraceUI() {
       role="status"
       aria-live="polite">
 
-      Loading recognition engine…
+      Loading recognition
+      engine…
 
     </div>
 
@@ -334,7 +775,9 @@ function ensureThreeTraceUI() {
     </div>
 
     <div id="liveReadings">
+
       T1 — · T2 — · T3 —
+
     </div>
 
     <button
@@ -350,327 +793,884 @@ function ensureThreeTraceUI() {
       playsinline
       muted
       style="display:none">
+
     </video>
 
   `;
 }
 
-function initApp() {
+buildUI();
 
-  ensureThreeTraceUI();
+const startBtn =
+  $('startBtn');
 
-  const W = 480;
-  const H = 360;
+const stopBtn =
+  $('stopBtn');
 
-  const MAX_SCREEN_POINTS = 520;
-  const CORNER_POOL = 8000;
+const shareBtn =
+  $('shareBtn');
 
-  const MAX_PATTERN_SIZE = 512;
-  const MAX_PATTERN_POINTS = 300;
+const statusEl =
+  $('status');
 
-  const TRAIN_LEVELS = 4;
+const detailsEl =
+  $('details');
 
-  const MATCH_THRESHOLD = 50;
+const readyLineEl =
+  $('readyLine');
 
-  const FRAME_INTERVAL_MS = 320;
+const liveReadingsEl =
+  $('liveReadings');
 
-  const $ = (id) =>
-    document.getElementById(id);
+const video =
+  $('cameraVideo');
 
-  const startBtn =
-    $('startBtn');
+const canvas =
+  $('cameraCanvas');
 
-  const stopBtn =
-    $('stopBtn');
-
-  const statusEl =
-    $('status');
-
-  const detailsEl =
-    $('details');
-
-  const liveReadingsEl =
-    $('liveReadings');
-
-  const video =
-    $('cameraVideo');
-
-  const canvas =
-    $('cameraCanvas');
-
-  const ctx =
-    canvas.getContext(
-      '2d',
-      {
-        willReadFrequently: true
-      }
-    );
-
-  const cameraBox =
-    $('cameraBox');
-
-  const foundBadge =
-    $('foundBadge');
-
-  let jsfeat = null;
-
-  let stream = null;
-
-  let timer = null;
-
-  let processing = false;
-
-  let audioContext = null;
-
-  let currentSource = null;
-
-  let isAudioPlaying = false;
-
-  let blockedTraceId = null;
-
-  let blockedClearFrames = 0;
-
-  let imgU8 = null;
-
-  let imgSmooth = null;
-
-  let screenCorners = null;
-
-  let screenDescriptors = null;
-
-  let matchScratch = [];
-
-  const traces =
-    [1, 2, 3].map(
-      (id) => ({
-
-        id,
-
-        imageInput:
-          $(`traceImage${id}`),
-
-        soundInput:
-          $(`traceSound${id}`),
-
-        imageLabel:
-          $(`imageLabel${id}`),
-
-        soundLabel:
-          $(`soundLabel${id}`),
-
-        thresholdInput:
-          $(`traceThreshold${id}`),
-
-        infoEl:
-          $(`traceInfo${id}`),
-
-        imageReady: false,
-
-        soundReady: false,
-
-        featureCount: 0,
-
-        audioBuffer: null,
-
-        patternCorners: [],
-
-        patternDescriptors: [],
-
-        patternBaseWidth: 0,
-
-        patternBaseHeight: 0,
-
-        homo3x3: null,
-
-        matchMask: null,
-
-        lastGoodMatches: 0,
-
-        lastCandidateMatches: 0
-
-      })
-    );
-
-  function setStatus(
-    text,
-    details = ''
-  ) {
-
-    statusEl.textContent =
-      text;
-
-    detailsEl.textContent =
-      details;
-  }
-
-  function traceThreshold(
-    trace
-  ) {
-
-    const value =
-      clampThreshold(
-        trace.thresholdInput.value
-      );
-
-    trace.thresholdInput.value =
-      String(value);
-
-    return value;
-  }
-
-  function traceIsReady(
-    trace
-  ) {
-
-    return (
-      trace.imageReady &&
-      trace.soundReady
-    );
-  }
-
-  function readyCount() {
-
-    return traces.filter(
-      traceIsReady
-    ).length;
-  }
-
-  function updateTraceInfo(
-    trace
-  ) {
-
-    const parts = [];
-
-    if (trace.imageReady) {
-
-      parts.push(
-        `${trace.featureCount} features`
-      );
-
-    } else {
-
-      parts.push(
-        'image not ready'
-      );
+const ctx =
+  canvas.getContext(
+    '2d',
+    {
+      willReadFrequently:
+        true
     }
+  );
 
-    parts.push(
-      trace.soundReady
-        ? 'sound ready'
-        : 'sound not ready'
+const cameraBox =
+  $('cameraBox');
+
+const foundBadge =
+  $('foundBadge');
+
+const exposureSlider =
+  $('exposureSlider');
+
+const exposureValue =
+  $('exposureValue');
+
+const thresholdPanel =
+  $('thresholdPanel');
+
+function setStatus(
+  text,
+  details = ''
+) {
+
+  statusEl.textContent =
+    text;
+
+  detailsEl.textContent =
+    details;
+}
+
+function updateExposureLabel() {
+
+  exposureValue.textContent =
+    exposure > 0
+      ? `+${exposure}`
+      : String(exposure);
+}
+
+const suppliedExposure =
+  Number(
+    PAGE_PARAMS.get('e')
+  );
+
+if (
+  Number.isFinite(
+    suppliedExposure
+  )
+) {
+
+  exposure =
+    clamp(
+      suppliedExposure,
+      -30,
+      30
     );
 
-    parts.push(
-      `trigger ${traceThreshold(trace)}`
+  exposureSlider.value =
+    String(exposure);
+}
+
+for (
+  const trace
+  of traces
+) {
+
+  const input =
+    $(
+      `threshold${trace.id}`
     );
 
-    trace.infoEl.textContent =
-      parts.join(' · ');
-  }
+  input?.addEventListener(
+    'change',
+    () => {
 
-  function updateStartButton() {
-
-    const count =
-      readyCount();
-
-    startBtn.disabled =
-      !(jsfeat && count > 0);
-
-    if (!stream && jsfeat) {
-
-      if (count === 0) {
-
-        setStatus(
-          'Prepare at least one trace + sound pair.'
+      trace.threshold =
+        Math.round(
+          clamp(
+            input.value,
+            4,
+            100
+          )
         );
 
-      } else {
-
-        setStatus(
-          `${count}/3 trace${count === 1 ? '' : 's'} ready.`,
-          'Press START CAMERA + SOUND when ready.'
+      input.value =
+        String(
+          trace.threshold
         );
-      }
+
+      updateLiveReadings();
     }
+  );
+}
+
+exposureSlider.addEventListener(
+  'input',
+  () => {
+
+    exposure =
+      clamp(
+        exposureSlider.value,
+        -30,
+        30
+      );
+
+    updateExposureLabel();
+  }
+);
+
+if (AUDIENCE_MODE) {
+
+  thresholdPanel.style.display =
+    'none';
+
+  liveReadingsEl.style.display =
+    'none';
+
+  shareBtn.style.display =
+    'none';
+}
+
+function buildAudienceUrl() {
+
+  const url =
+    new URL(
+      window.location.href
+    );
+
+  url.search = '';
+
+  url.searchParams.set(
+    'audience',
+    '1'
+  );
+
+  for (
+    const trace
+    of traces
+  ) {
+
+    url.searchParams.set(
+      `t${trace.id}`,
+      String(
+        trace.threshold
+      )
+    );
   }
 
-  function updateLiveReadings() {
+  url.searchParams.set(
+    'e',
+    String(exposure)
+  );
 
-    liveReadingsEl.textContent =
-      traces.map(
-        (trace) => {
+  return url.toString();
+}
 
-          if (
-            !trace.imageReady
-          ) {
+async function shareAudienceLink() {
 
-            return `T${trace.id} —`;
-          }
+  const url =
+    buildAudienceUrl();
 
-          const blocked =
-            blockedTraceId ===
-            trace.id
-              ? ' BLOCKED'
-              : '';
+  const shareData = {
 
-          return (
-            `T${trace.id} ` +
-            `${trace.lastGoodMatches}/` +
-            `${trace.lastCandidateMatches} ` +
-            `[trigger ${traceThreshold(trace)}]` +
-            blocked
-          );
-        }
-      ).join(' · ');
-  }
+    title:
+      'Trace → Sound',
 
-  function initVision() {
+    text:
+      'Open this link and press START CAMERA + SOUND.',
+
+    url
+  };
+
+  try {
 
     if (
-      !globalThis.jsfeatNext
+      navigator.share
     ) {
 
+      await navigator.share(
+        shareData
+      );
+
       setStatus(
-        'Recognition library did not load.',
-        'Check the internet connection and reload this page.'
+        'Audience link ready to share.'
       );
 
       return;
     }
 
-    jsfeat =
-      globalThis.jsfeatNext;
+    if (
+      navigator.clipboard
+        ?.writeText
+    ) {
 
-    imgU8 =
-      new jsfeat.matrix_t(
-        W,
-        H,
-        jsfeat.U8_t |
-        jsfeat.C1_t
+      await navigator.clipboard
+        .writeText(url);
+
+      setStatus(
+        'Audience link copied.',
+        url
       );
 
-    imgSmooth =
+      return;
+    }
+
+    window.prompt(
+      'Copy this audience link:',
+      url
+    );
+
+  } catch (err) {
+
+    if (
+      err?.name !==
+      'AbortError'
+    ) {
+
+      console.error(err);
+
+      setStatus(
+        'Could not share automatically.',
+        url
+      );
+    }
+  }
+}
+
+shareBtn.addEventListener(
+  'click',
+  shareAudienceLink
+);
+
+function updateReadyState() {
+
+  const readyCount =
+    traces.filter(
+      (t) => t.ready
+    ).length;
+
+  readyLineEl.textContent =
+    `${readyCount}/3 traces ready`;
+
+  startBtn.disabled =
+    !(
+      jsfeat &&
+      readyCount > 0
+    );
+}
+
+function updateLiveReadings() {
+
+  liveReadingsEl.textContent =
+    traces.map(
+      (trace) => {
+
+        if (
+          !trace.imageReady
+        ) {
+
+          return (
+            `T${trace.id} —`
+          );
+        }
+
+        const blocked =
+          blockedTraceId ===
+          trace.id
+            ? ' BLOCKED'
+            : '';
+
+        return (
+
+          `T${trace.id} ` +
+
+          `${trace.lastGoodMatches}/` +
+
+          `${trace.lastCandidateMatches} ` +
+
+          `[trigger ${trace.threshold}]` +
+
+          blocked
+        );
+
+      }
+    ).join(' · ');
+}
+
+function initVision() {
+
+  if (
+    !globalThis.jsfeatNext
+  ) {
+
+    setStatus(
+      'Recognition library did not load.',
+      'Check the internet connection and reload the page.'
+    );
+
+    return;
+  }
+
+  jsfeat =
+    globalThis.jsfeatNext;
+
+  imgU8 =
+    new jsfeat.matrix_t(
+      W,
+      H,
+      jsfeat.U8_t |
+      jsfeat.C1_t
+    );
+
+  imgSmooth =
+    new jsfeat.matrix_t(
+      W,
+      H,
+      jsfeat.U8_t |
+      jsfeat.C1_t
+    );
+
+  screenDescriptors =
+    new jsfeat.matrix_t(
+      32,
+      MAX_SCREEN_POINTS,
+      jsfeat.U8_t |
+      jsfeat.C1_t
+    );
+
+  screenCorners =
+    Array.from(
+      {
+        length:
+          CORNER_POOL
+      },
+
+      () =>
+        new jsfeat.keypoint_t(
+          0,
+          0,
+          0,
+          0,
+          -1
+        )
+    );
+
+  matchScratch =
+    Array.from(
+      {
+        length:
+          MAX_SCREEN_POINTS
+      },
+
+      () => ({
+
+        screen_idx: 0,
+
+        pattern_lev: 0,
+
+        pattern_idx: 0,
+
+        distance: 0
+
+      })
+    );
+
+  for (
+    const trace
+    of traces
+  ) {
+
+    trace.homo3x3 =
       new jsfeat.matrix_t(
-        W,
-        H,
-        jsfeat.U8_t |
-        jsfeat.C1_t
+        3,
+        3,
+        jsfeat.F32C1_t
       );
 
-    screenDescriptors =
+    trace.matchMask =
       new jsfeat.matrix_t(
-        32,
         MAX_SCREEN_POINTS,
+        1,
+        jsfeat.U8C1_t
+      );
+  }
+
+  setStatus(
+    'Recognition ready. Loading trace files…'
+  );
+
+  updateReadyState();
+}
+
+const U_MAX =
+  new Int32Array([
+
+    15,15,15,15,
+
+    14,14,14,
+
+    13,13,
+
+    12,11,10,
+
+    9,8,6,3,0
+
+  ]);
+
+function icAngle(
+  img,
+  px,
+  py
+) {
+
+  const halfK = 15;
+
+  let m01 = 0;
+  let m10 = 0;
+
+  const src =
+    img.data;
+
+  const step =
+    img.cols;
+
+  const centerOff =
+    (
+      py *
+      step +
+      px
+    ) | 0;
+
+  for (
+    let u = -halfK;
+    u <= halfK;
+    u++
+  ) {
+
+    m10 +=
+      u *
+      src[
+        centerOff +
+        u
+      ];
+  }
+
+  for (
+    let v = 1;
+    v <= halfK;
+    v++
+  ) {
+
+    let vSum = 0;
+
+    const d =
+      U_MAX[v];
+
+    for (
+      let u = -d;
+      u <= d;
+      u++
+    ) {
+
+      const plus =
+        src[
+          centerOff +
+          u +
+          v *
+          step
+        ];
+
+      const minus =
+        src[
+          centerOff +
+          u -
+          v *
+          step
+        ];
+
+      vSum +=
+        plus -
+        minus;
+
+      m10 +=
+        u *
+        (
+          plus +
+          minus
+        );
+    }
+
+    m01 +=
+      v *
+      vSum;
+  }
+
+  return Math.atan2(
+    m01,
+    m10
+  );
+}
+
+function detectKeypoints(
+  img,
+  corners,
+  maxAllowed
+) {
+
+  const yape06 =
+    jsfeat.yape06;
+
+  yape06.laplacian_threshold =
+    25;
+
+  yape06.min_eigen_value_threshold =
+    20;
+
+  let count =
+    yape06.detect(
+      img,
+      corners,
+      20
+    );
+
+  if (
+    count >
+    maxAllowed
+  ) {
+
+    jsfeat.math.qsort(
+      corners,
+      0,
+      count - 1,
+
+      (a, b) =>
+        b.score <
+        a.score
+    );
+
+    count =
+      maxAllowed;
+  }
+
+  for (
+    let i = 0;
+    i < count;
+    i++
+  ) {
+
+    corners[i].angle =
+      icAngle(
+        img,
+        corners[i].x,
+        corners[i].y
+      );
+  }
+
+  return count;
+}
+
+async function loadImageElement(
+  url
+) {
+
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+
+      const img =
+        new Image();
+
+      img.onload =
+        () =>
+          resolve(img);
+
+      img.onerror =
+        reject;
+
+      img.src =
+        url;
+    }
+  );
+}
+
+function trainTrace(
+  trace,
+  image
+) {
+
+  const maxInput =
+    900;
+
+  const inputScale =
+    Math.min(
+
+      1,
+
+      maxInput /
+      image.naturalWidth,
+
+      maxInput /
+      image.naturalHeight
+
+    );
+
+  const sourceW =
+    Math.max(
+
+      64,
+
+      Math.round(
+        image.naturalWidth *
+        inputScale
+      )
+    );
+
+  const sourceH =
+    Math.max(
+
+      64,
+
+      Math.round(
+        image.naturalHeight *
+        inputScale
+      )
+    );
+
+  const sourceCanvas =
+    document.createElement(
+      'canvas'
+    );
+
+  sourceCanvas.width =
+    sourceW;
+
+  sourceCanvas.height =
+    sourceH;
+
+  const sourceCtx =
+    sourceCanvas.getContext(
+      '2d',
+      {
+        willReadFrequently:
+          true
+      }
+    );
+
+  sourceCtx.drawImage(
+    image,
+    0,
+    0,
+    sourceW,
+    sourceH
+  );
+
+  const sc0 =
+    Math.min(
+
+      1,
+
+      MAX_PATTERN_SIZE /
+      sourceW,
+
+      MAX_PATTERN_SIZE /
+      sourceH
+
+    );
+
+  const baseW =
+    Math.max(
+      64,
+      (
+        sourceW *
+        sc0
+      ) | 0
+    );
+
+  const baseH =
+    Math.max(
+      64,
+      (
+        sourceH *
+        sc0
+      ) | 0
+    );
+
+  const sourceData =
+    sourceCtx.getImageData(
+      0,
+      0,
+      sourceW,
+      sourceH
+    );
+
+  const sourceGray =
+    new jsfeat.matrix_t(
+      sourceW,
+      sourceH,
+      jsfeat.U8_t |
+      jsfeat.C1_t
+    );
+
+  const level0 =
+    new jsfeat.matrix_t(
+      baseW,
+      baseH,
+      jsfeat.U8_t |
+      jsfeat.C1_t
+    );
+
+  jsfeat.imgproc.grayscale(
+
+    sourceData.data,
+
+    sourceW,
+    sourceH,
+
+    sourceGray
+
+  );
+
+  jsfeat.imgproc.resample(
+
+    sourceGray,
+
+    level0,
+
+    baseW,
+    baseH
+
+  );
+
+  trace.patternCorners =
+    [];
+
+  trace.patternDescriptors =
+    [];
+
+  trace.patternBaseWidth =
+    baseW;
+
+  trace.patternBaseHeight =
+    baseH;
+
+  let totalPoints = 0;
+
+  let scale = 1.0;
+
+  const scaleStep =
+    Math.sqrt(2.0);
+
+  for (
+    let lev = 0;
+    lev < TRAIN_LEVELS;
+    lev++
+  ) {
+
+    const levelW =
+      Math.max(
+
+        64,
+
+        (
+          baseW *
+          scale
+        ) | 0
+      );
+
+    const levelH =
+      Math.max(
+
+        64,
+
+        (
+          baseH *
+          scale
+        ) | 0
+      );
+
+    const levelImg =
+      new jsfeat.matrix_t(
+        levelW,
+        levelH,
         jsfeat.U8_t |
         jsfeat.C1_t
       );
 
-    screenCorners =
+    if (
+      lev === 0
+    ) {
+
+      jsfeat.imgproc
+        .gaussian_blur(
+          level0,
+          levelImg,
+          5
+        );
+
+    } else {
+
+      jsfeat.imgproc
+        .resample(
+          level0,
+          levelImg,
+          levelW,
+          levelH
+        );
+
+      jsfeat.imgproc
+        .gaussian_blur(
+          levelImg,
+          levelImg,
+          5
+        );
+    }
+
+    const corners =
       Array.from(
+
         {
           length:
-            CORNER_POOL
+            Math.min(
+
+              CORNER_POOL,
+
+              Math.max(
+
+                1500,
+
+                (
+                  levelW *
+                  levelH
+                ) >> 4
+              )
+            )
         },
+
         () =>
           new jsfeat.keypoint_t(
             0,
@@ -681,353 +1681,338 @@ function initApp() {
           )
       );
 
-    matchScratch =
-      Array.from(
-        {
-          length:
-            MAX_SCREEN_POINTS
-        },
-        () => ({
-          screen_idx: 0,
-          pattern_lev: 0,
-          pattern_idx: 0,
-          distance: 0
-        })
+    const descriptors =
+      new jsfeat.matrix_t(
+
+        32,
+
+        MAX_PATTERN_POINTS,
+
+        jsfeat.U8_t |
+        jsfeat.C1_t
       );
 
-    for (
-      const trace
-      of traces
-    ) {
+    const count =
+      detectKeypoints(
 
-      trace.homo3x3 =
-        new jsfeat.matrix_t(
-          3,
-          3,
-          jsfeat.F32C1_t
-        );
+        levelImg,
 
-      trace.matchMask =
-        new jsfeat.matrix_t(
-          MAX_SCREEN_POINTS,
-          1,
-          jsfeat.U8C1_t
-        );
-
-      updateTraceInfo(
-        trace
-      );
-    }
-
-    setStatus(
-      'Ready. Prepare your trace images and sounds.'
-    );
-
-    updateStartButton();
-  }
-
-  const U_MAX =
-    new Int32Array([
-      15, 15, 15, 15,
-      14, 14, 14,
-      13, 13,
-      12, 11, 10,
-      9, 8, 6, 3, 0
-    ]);
-
-  function icAngle(
-    img,
-    px,
-    py
-  ) {
-
-    const halfK = 15;
-
-    let m01 = 0;
-
-    let m10 = 0;
-
-    const src =
-      img.data;
-
-    const step =
-      img.cols;
-
-    const centerOff =
-      (
-        py * step +
-        px
-      ) | 0;
-
-    for (
-      let u = -halfK;
-      u <= halfK;
-      u++
-    ) {
-
-      m10 +=
-        u *
-        src[
-          centerOff +
-          u
-        ];
-    }
-
-    for (
-      let v = 1;
-      v <= halfK;
-      v++
-    ) {
-
-      let vSum = 0;
-
-      const d =
-        U_MAX[v];
-
-      for (
-        let u = -d;
-        u <= d;
-        u++
-      ) {
-
-        const plus =
-          src[
-            centerOff +
-            u +
-            v * step
-          ];
-
-        const minus =
-          src[
-            centerOff +
-            u -
-            v * step
-          ];
-
-        vSum +=
-          plus - minus;
-
-        m10 +=
-          u *
-          (
-            plus +
-            minus
-          );
-      }
-
-      m01 +=
-        v * vSum;
-    }
-
-    return Math.atan2(
-      m01,
-      m10
-    );
-  }
-
-  function detectKeypoints(
-    img,
-    corners,
-    maxAllowed
-  ) {
-
-    const yape06 =
-      jsfeat.yape06;
-
-    yape06.laplacian_threshold =
-      25;
-
-    yape06.min_eigen_value_threshold =
-      20;
-
-    let count =
-      yape06.detect(
-        img,
         corners,
-        20
+
+        MAX_PATTERN_POINTS
       );
+
+    jsfeat.orb.describe(
+
+      levelImg,
+
+      corners,
+
+      count,
+
+      descriptors
+    );
 
     if (
-      count >
-      maxAllowed
+      lev > 0
     ) {
 
-      jsfeat.math.qsort(
-        corners,
-        0,
-        count - 1,
-        (a, b) =>
-          b.score <
-          a.score
-      );
+      for (
+        let i = 0;
+        i < count;
+        i++
+      ) {
 
-      count =
-        maxAllowed;
+        corners[i].x *=
+          1 /
+          scale;
+
+        corners[i].y *=
+          1 /
+          scale;
+      }
     }
 
-    for (
-      let i = 0;
-      i < count;
-      i++
-    ) {
+    trace.patternCorners[
+      lev
+    ] = corners;
 
-      corners[i].angle =
-        icAngle(
-          img,
-          corners[i].x,
-          corners[i].y
-        );
-    }
+    trace.patternDescriptors[
+      lev
+    ] = descriptors;
 
-    return count;
+    totalPoints +=
+      count;
+
+    scale /=
+      scaleStep;
   }
 
-  function trainTrace(
-    trace,
-    image
-  ) {
+  trace.featureCount =
+    totalPoints;
 
-    const maxInput =
-      900;
+  trace.imageReady =
+    totalPoints >= 40;
+}
 
-    const inputScale =
-      Math.min(
-        1,
-        maxInput /
-          image.naturalWidth,
-        maxInput /
-          image.naturalHeight
+async function loadTraceAssets(
+  trace
+) {
+
+  try {
+
+    const image =
+      await loadImageElement(
+        trace.image
       );
 
-    const sourceW =
-      Math.max(
-        64,
-        Math.round(
-          image.naturalWidth *
-          inputScale
-        )
-      );
+    trainTrace(
+      trace,
+      image
+    );
 
-    const sourceH =
-      Math.max(
-        64,
-        Math.round(
-          image.naturalHeight *
-          inputScale
-        )
-      );
+  } catch (err) {
 
-    const sourceCanvas =
-      document.createElement(
-        'canvas'
-      );
+    console.error(
+      `Trace ${trace.id} image failed`,
+      err
+    );
 
-    sourceCanvas.width =
-      sourceW;
+    trace.imageReady =
+      false;
+  }
 
-    sourceCanvas.height =
-      sourceH;
+  try {
 
-    const sourceCtx =
-      sourceCanvas.getContext(
-        '2d',
+    audioContext ||=
+      new (
+        window.AudioContext ||
+        window.webkitAudioContext
+      )();
+
+    const response =
+      await fetch(
+
+        trace.sound,
+
         {
-          willReadFrequently:
-            true
+          cache:
+            'no-store'
         }
       );
 
-    sourceCtx.drawImage(
-      image,
-      0,
-      0,
-      sourceW,
-      sourceH
+    if (
+      !response.ok
+    ) {
+
+      throw new Error(
+        `HTTP ${response.status}`
+      );
+    }
+
+    const data =
+      await response
+        .arrayBuffer();
+
+    trace.audioBuffer =
+      await audioContext
+        .decodeAudioData(
+          data.slice(0)
+        );
+
+    trace.soundReady =
+      true;
+
+  } catch (err) {
+
+    console.error(
+      `Trace ${trace.id} sound failed`,
+      err
     );
 
-    const sc0 =
-      Math.min(
-        1,
-        MAX_PATTERN_SIZE /
-          sourceW,
-        MAX_PATTERN_SIZE /
-          sourceH
-      );
+    trace.soundReady =
+      false;
+  }
 
-    const baseW =
-      Math.max(
-        64,
+  trace.ready =
+    trace.imageReady &&
+    trace.soundReady;
+
+  updateReadyState();
+
+  updateLiveReadings();
+}
+
+async function loadAllAssets() {
+
+  await Promise.all(
+    traces.map(
+      loadTraceAssets
+    )
+  );
+
+  const readyCount =
+    traces.filter(
+      (t) => t.ready
+    ).length;
+
+  if (
+    readyCount > 0
+  ) {
+
+    setStatus(
+
+      `${readyCount}/3 traces loaded.`,
+
+      'Press START CAMERA + SOUND.'
+
+    );
+
+  } else {
+
+    setStatus(
+
+      'No traces loaded.',
+
+      'Check the traces/ and sounds/ folders and filenames.'
+
+    );
+  }
+}
+
+function drawVideoCover() {
+
+  const vw =
+    video.videoWidth ||
+    W;
+
+  const vh =
+    video.videoHeight ||
+    H;
+
+  const scale =
+    Math.max(
+      W / vw,
+      H / vh
+    );
+
+  const sw =
+    W /
+    scale;
+
+  const sh =
+    H /
+    scale;
+
+  const sx =
+    (
+      vw -
+      sw
+    ) / 2;
+
+  const sy =
+    (
+      vh -
+      sh
+    ) / 2;
+
+  const brightness =
+    100 +
+    exposure;
+
+  ctx.save();
+
+  ctx.filter =
+    `brightness(${brightness}%)`;
+
+  ctx.drawImage(
+
+    video,
+
+    sx,
+    sy,
+    sw,
+    sh,
+
+    0,
+    0,
+    W,
+    H
+
+  );
+
+  ctx.restore();
+}
+
+function popcnt32(n) {
+
+  n -=
+    (
+      n >> 1
+    ) &
+    0x55555555;
+
+  n =
+    (
+      n &
+      0x33333333
+    ) +
+
+    (
+      (
+        n >> 2
+      ) &
+      0x33333333
+    );
+
+  return (
+
+    (
+      (
         (
-          sourceW *
-          sc0
-        ) | 0
-      );
+          n +
+          (
+            n >> 4
+          )
+        ) &
+        0x0F0F0F0F
+      ) *
 
-    const baseH =
-      Math.max(
-        64,
-        (
-          sourceH *
-          sc0
-        ) | 0
-      );
+      0x01010101
 
-    const sourceData =
-      sourceCtx.getImageData(
-        0,
-        0,
-        sourceW,
-        sourceH
-      );
+    ) >> 24
+  );
+}
 
-    const sourceGray =
-      new jsfeat.matrix_t(
-        sourceW,
-        sourceH,
-        jsfeat.U8_t |
-        jsfeat.C1_t
-      );
+function matchPattern(
+  trace
+) {
 
-    const level0 =
-      new jsfeat.matrix_t(
-        baseW,
-        baseH,
-        jsfeat.U8_t |
-        jsfeat.C1_t
-      );
+  const qCnt =
+    screenDescriptors.rows;
 
-    jsfeat.imgproc.grayscale(
-      sourceData.data,
-      sourceW,
-      sourceH,
-      sourceGray
-    );
+  const queryU32 =
+    screenDescriptors
+      .buffer.i32;
 
-    jsfeat.imgproc.resample(
-      sourceGray,
-      level0,
-      baseW,
-      baseH
-    );
+  let qdOff = 0;
 
-    trace.patternCorners =
-      [];
+  let numMatches = 0;
 
-    trace.patternDescriptors =
-      [];
+  for (
+    let qidx = 0;
+    qidx < qCnt;
+    qidx++
+  ) {
 
-    trace.patternBaseWidth =
-      baseW;
+    let bestDist =
+      256;
 
-    trace.patternBaseHeight =
-      baseH;
+    let bestIdx =
+      -1;
 
-    let totalPoints = 0;
-
-    let scale = 1.0;
-
-    const scaleStep =
-      Math.sqrt(2.0);
+    let bestLev =
+      -1;
 
     for (
       let lev = 0;
@@ -1035,1342 +2020,764 @@ function initApp() {
       lev++
     ) {
 
-      const levelW =
-        Math.max(
-          64,
-          (
-            baseW *
-            scale
-          ) | 0
-        );
-
-      const levelH =
-        Math.max(
-          64,
-          (
-            baseH *
-            scale
-          ) | 0
-        );
-
-      const levelImg =
-        new jsfeat.matrix_t(
-          levelW,
-          levelH,
-          jsfeat.U8_t |
-          jsfeat.C1_t
-        );
-
-      if (lev === 0) {
-
-        jsfeat.imgproc
-          .gaussian_blur(
-            level0,
-            levelImg,
-            5
-          );
-
-      } else {
-
-        jsfeat.imgproc
-          .resample(
-            level0,
-            levelImg,
-            levelW,
-            levelH
-          );
-
-        jsfeat.imgproc
-          .gaussian_blur(
-            levelImg,
-            levelImg,
-            5
-          );
-      }
-
-      const corners =
-        Array.from(
-          {
-            length:
-              Math.min(
-                CORNER_POOL,
-                Math.max(
-                  1500,
-                  (
-                    levelW *
-                    levelH
-                  ) >> 4
-                )
-              )
-          },
-          () =>
-            new jsfeat.keypoint_t(
-              0,
-              0,
-              0,
-              0,
-              -1
-            )
-        );
-
-      const descriptors =
-        new jsfeat.matrix_t(
-          32,
-          MAX_PATTERN_POINTS,
-          jsfeat.U8_t |
-          jsfeat.C1_t
-        );
-
-      const count =
-        detectKeypoints(
-          levelImg,
-          corners,
-          MAX_PATTERN_POINTS
-        );
-
-      jsfeat.orb.describe(
-        levelImg,
-        corners,
-        count,
-        descriptors
-      );
-
-      if (lev > 0) {
-
-        for (
-          let i = 0;
-          i < count;
-          i++
-        ) {
-
-          corners[i].x *=
-            1 / scale;
-
-          corners[i].y *=
-            1 / scale;
-        }
-      }
-
-      trace.patternCorners[
-        lev
-      ] = corners;
-
-      trace.patternDescriptors[
-        lev
-      ] = descriptors;
-
-      totalPoints +=
-        count;
-
-      scale /=
-        scaleStep;
-    }
-
-    trace.featureCount =
-      totalPoints;
-
-    trace.imageReady =
-      totalPoints >= 40;
-
-    return totalPoints;
-  }
-
-  async function loadTraceImage(
-    trace
-  ) {
-
-    const file =
-      trace.imageInput
-        .files?.[0];
-
-    if (
-      !file ||
-      !jsfeat
-    ) {
-      return;
-    }
-
-    const url =
-      URL.createObjectURL(
-        file
-      );
-
-    const image =
-      new Image();
-
-    image.onload =
-      () => {
-
-        try {
-
-          const points =
-            trainTrace(
-              trace,
-              image
-            );
-
-          trace.imageLabel
-            .classList.toggle(
-              'ready',
-              trace.imageReady
-            );
-
-          trace.imageLabel
-            .childNodes[0]
-            .textContent =
-              trace.imageReady
-                ? 'IMAGE READY ✓'
-                : 'CHOOSE BETTER IMAGE';
-
-          if (
-            !trace.imageReady
-          ) {
-
-            setStatus(
-              `Trace ${trace.id} is too plain.`,
-              `${points} features found. Try an image with more texture, edges or detail.`
-            );
-
-          } else {
-
-            setStatus(
-              `Trace ${trace.id} image prepared.`,
-              `${points} reference features found.`
-            );
-          }
-
-        } catch (err) {
-
-          console.error(
-            err
-          );
-
-          trace.imageReady =
-            false;
-
-          trace.imageLabel
-            .classList.remove(
-              'ready'
-            );
-
-          setStatus(
-            `Could not prepare Trace ${trace.id}.`,
-            'Try a smaller or more detailed image.'
-          );
-
-        } finally {
-
-          URL.revokeObjectURL(
-            url
-          );
-
-          updateTraceInfo(
-            trace
-          );
-
-          updateStartButton();
-
-          updateLiveReadings();
-        }
-      };
-
-    image.onerror =
-      () => {
-
-        URL.revokeObjectURL(
-          url
-        );
-
-        setStatus(
-          `Could not read Trace ${trace.id} image.`
-        );
-      };
-
-    image.src =
-      url;
-  }
-
-  async function loadTraceSound(
-    trace
-  ) {
-
-    const file =
-      trace.soundInput
-        .files?.[0];
-
-    if (!file) {
-      return;
-    }
-
-    try {
-
-      audioContext ||=
-        new (
-          window.AudioContext ||
-          window.webkitAudioContext
-        )();
-
-      const data =
-        await file.arrayBuffer();
-
-      trace.audioBuffer =
-        await audioContext
-          .decodeAudioData(
-            data.slice(0)
-          );
-
-      trace.soundReady =
-        true;
-
-      trace.soundLabel
-        .classList.add(
-          'ready'
-        );
-
-      trace.soundLabel
-        .childNodes[0]
-        .textContent =
-          'SOUND READY ✓';
-
-      setStatus(
-        `Trace ${trace.id} sound prepared.`
-      );
-
-    } catch (err) {
-
-      console.error(
-        err
-      );
-
-      trace.soundReady =
-        false;
-
-      trace.audioBuffer =
-        null;
-
-      trace.soundLabel
-        .classList.remove(
-          'ready'
-        );
-
-      setStatus(
-        `Could not read Trace ${trace.id} sound.`,
-        'MP3, M4A or WAV usually work best.'
-      );
-    }
-
-    updateTraceInfo(
-      trace
-    );
-
-    updateStartButton();
-  }
-
-  for (
-    const trace
-    of traces
-  ) {
-
-    trace.imageInput
-      .addEventListener(
-        'change',
-        () =>
-          loadTraceImage(
-            trace
-          )
-      );
-
-    trace.soundInput
-      .addEventListener(
-        'change',
-        () =>
-          loadTraceSound(
-            trace
-          )
-      );
-
-    trace.thresholdInput
-      .addEventListener(
-        'change',
-        () => {
-
-          trace.thresholdInput
-            .value =
-              String(
-                traceThreshold(
-                  trace
-                )
-              );
-
-          updateTraceInfo(
-            trace
-          );
-
-          updateLiveReadings();
-        }
-      );
-  }
-
-  function drawVideoCover() {
-
-    const vw =
-      video.videoWidth ||
-      W;
-
-    const vh =
-      video.videoHeight ||
-      H;
-
-    const scale =
-      Math.max(
-        W / vw,
-        H / vh
-      );
-
-    const sw =
-      W / scale;
-
-    const sh =
-      H / scale;
-
-    const sx =
-      (
-        vw - sw
-      ) / 2;
-
-    const sy =
-      (
-        vh - sh
-      ) / 2;
-
-    ctx.drawImage(
-      video,
-      sx,
-      sy,
-      sw,
-      sh,
-      0,
-      0,
-      W,
-      H
-    );
-  }
-
-  function popcnt32(n) {
-
-    n -=
-      (
-        n >> 1
-      ) &
-      0x55555555;
-
-    n =
-      (
-        n &
-        0x33333333
-      ) +
-      (
-        (
-          n >> 2
-        ) &
-        0x33333333
-      );
-
-    return (
-      (
-        (
-          (
-            n +
-            (
-              n >> 4
-            )
-          ) &
-          0x0F0F0F0F
-        ) *
-        0x01010101
-      ) >> 24
-    );
-  }
-
-  function matchPattern(
-    trace
-  ) {
-
-    const qCnt =
-      screenDescriptors.rows;
-
-    const queryU32 =
-      screenDescriptors
-        .buffer.i32;
-
-    let qdOff = 0;
-
-    let numMatches = 0;
-
-    for (
-      let qidx = 0;
-      qidx < qCnt;
-      qidx++
-    ) {
-
-      let bestDist =
-        256;
-
-      let bestIdx =
-        -1;
-
-      let bestLev =
-        -1;
-
-      for (
-        let lev = 0;
-        lev < TRAIN_LEVELS;
-        lev++
-      ) {
-
-        const desc =
-          trace.patternDescriptors[
+      const desc =
+        trace
+          .patternDescriptors[
             lev
           ];
 
-        if (!desc) {
-          continue;
-        }
-
-        const ldCnt =
-          desc.rows;
-
-        const ldI32 =
-          desc.buffer.i32;
-
-        let ldOff = 0;
-
-        for (
-          let pidx = 0;
-          pidx < ldCnt;
-          pidx++
-        ) {
-
-          let curr = 0;
-
-          for (
-            let k = 0;
-            k < 8;
-            k++
-          ) {
-
-            curr +=
-              popcnt32(
-                queryU32[
-                  qdOff + k
-                ] ^
-                ldI32[
-                  ldOff + k
-                ]
-              );
-          }
-
-          if (
-            curr <
-            bestDist
-          ) {
-
-            bestDist =
-              curr;
-
-            bestLev =
-              lev;
-
-            bestIdx =
-              pidx;
-          }
-
-          ldOff += 8;
-        }
+      if (!desc) {
+        continue;
       }
 
-      if (
-        bestDist <
-          MATCH_THRESHOLD &&
-        numMatches <
-          matchScratch.length
+      const ldCnt =
+        desc.rows;
+
+      const ldI32 =
+        desc.buffer.i32;
+
+      let ldOff = 0;
+
+      for (
+        let pidx = 0;
+        pidx < ldCnt;
+        pidx++
       ) {
 
-        const match =
-          matchScratch[
-            numMatches++
-          ];
+        let curr = 0;
 
-        match.screen_idx =
-          qidx;
+        for (
+          let k = 0;
+          k < 8;
+          k++
+        ) {
 
-        match.pattern_lev =
-          bestLev;
+          curr +=
+            popcnt32(
 
-        match.pattern_idx =
-          bestIdx;
+              queryU32[
+                qdOff +
+                k
+              ] ^
 
-        match.distance =
-          bestDist;
+              ldI32[
+                ldOff +
+                k
+              ]
+            );
+        }
+
+        if (
+          curr <
+          bestDist
+        ) {
+
+          bestDist =
+            curr;
+
+          bestLev =
+            lev;
+
+          bestIdx =
+            pidx;
+        }
+
+        ldOff += 8;
       }
-
-      qdOff += 8;
     }
 
-    return numMatches;
-  }
+    if (
 
-  function findTransform(
-    trace,
-    count
-  ) {
+      bestDist <
+        MATCH_THRESHOLD &&
 
-    if (count < 4) {
-      return 0;
-    }
+      numMatches <
+        matchScratch.length
 
-    const params =
-      new jsfeat
-        .ransac_params_t(
-          4,
-          3,
-          0.5,
-          0.99
-        );
-
-    const patternXY =
-      new Array(
-        count
-      );
-
-    const screenXY =
-      new Array(
-        count
-      );
-
-    for (
-      let i = 0;
-      i < count;
-      i++
     ) {
 
       const match =
-        matchScratch[i];
-
-      const screenPoint =
-        screenCorners[
-          match.screen_idx
+        matchScratch[
+          numMatches++
         ];
 
-      const patternPoint =
-        trace.patternCorners[
-          match.pattern_lev
-        ][
-          match.pattern_idx
-        ];
+      match.screen_idx =
+        qidx;
 
-      patternXY[i] = {
-        x:
-          patternPoint.x,
-        y:
-          patternPoint.y
-      };
+      match.pattern_lev =
+        bestLev;
 
-      screenXY[i] = {
-        x:
-          screenPoint.x,
-        y:
-          screenPoint.y
-      };
+      match.pattern_idx =
+        bestIdx;
+
+      match.distance =
+        bestDist;
     }
 
-    const ok =
-      jsfeat.motion_estimator
-        .ransac(
-          params,
-          jsfeat.homography2d,
-          patternXY,
-          screenXY,
-          count,
-          trace.homo3x3,
-          trace.matchMask,
-          700
-        );
-
-    if (!ok) {
-
-      jsfeat.matmath
-        .identity_3x3(
-          trace.homo3x3,
-          1.0
-        );
-
-      return 0;
-    }
-
-    let good = 0;
-
-    for (
-      let i = 0;
-      i < count;
-      i++
-    ) {
-
-      if (
-        trace.matchMask
-          .data[i]
-      ) {
-
-        patternXY[good] =
-          patternXY[i];
-
-        screenXY[good] =
-          screenXY[i];
-
-        good++;
-      }
-    }
-
-    if (
-      good >= 4
-    ) {
-
-      jsfeat.homography2d
-        .run(
-          patternXY,
-          screenXY,
-          trace.homo3x3,
-          good
-        );
-    }
-
-    return good;
+    qdOff += 8;
   }
 
-  function drawDetectedShape(
-    trace
+  return numMatches;
+}
+
+function findTransform(
+  trace,
+  count
+) {
+
+  if (
+    count < 4
   ) {
 
-    const M =
-      trace.homo3x3.data;
+    return 0;
+  }
 
-    const base = [
-
-      {
-        x: 0,
-        y: 0
-      },
-
-      {
-        x:
-          trace.patternBaseWidth,
-        y: 0
-      },
-
-      {
-        x:
-          trace.patternBaseWidth,
-        y:
-          trace.patternBaseHeight
-      },
-
-      {
-        x: 0,
-        y:
-          trace.patternBaseHeight
-      }
-
-    ];
-
-    const points =
-      base.map(
-        (point) => {
-
-          const x =
-            M[0] *
-              point.x +
-            M[1] *
-              point.y +
-            M[2];
-
-          const y =
-            M[3] *
-              point.x +
-            M[4] *
-              point.y +
-            M[5];
-
-          const z =
-            M[6] *
-              point.x +
-            M[7] *
-              point.y +
-            M[8];
-
-          return {
-            x:
-              x / z,
-            y:
-              y / z
-          };
-        }
+  const params =
+    new jsfeat
+      .ransac_params_t(
+        4,
+        3,
+        0.5,
+        0.99
       );
 
-    if (
-      points.some(
-        (p) =>
-          !Number.isFinite(
-            p.x
-          ) ||
-          !Number.isFinite(
-            p.y
-          )
-      )
-    ) {
-
-      return;
-    }
-
-    ctx.save();
-
-    ctx.strokeStyle =
-      'red';
-
-    ctx.lineWidth =
-      5;
-
-    ctx.beginPath();
-
-    ctx.moveTo(
-      points[0].x,
-      points[0].y
+  const patternXY =
+    new Array(
+      count
     );
 
-    for (
-      let i = 1;
-      i < points.length;
-      i++
-    ) {
+  const screenXY =
+    new Array(
+      count
+    );
 
-      ctx.lineTo(
-        points[i].x,
-        points[i].y
-      );
-    }
+  for (
+    let i = 0;
+    i < count;
+    i++
+  ) {
 
-    ctx.closePath();
+    const match =
+      matchScratch[i];
 
-    ctx.stroke();
+    const screenPoint =
+      screenCorners[
+        match.screen_idx
+      ];
 
-    ctx.restore();
+    const patternPoint =
+      trace.patternCorners[
+        match.pattern_lev
+      ][
+        match.pattern_idx
+      ];
+
+    patternXY[i] = {
+
+      x:
+        patternPoint.x,
+
+      y:
+        patternPoint.y
+    };
+
+    screenXY[i] = {
+
+      x:
+        screenPoint.x,
+
+      y:
+        screenPoint.y
+    };
   }
 
-  function playTraceSound(
-    trace
+  const ok =
+    jsfeat
+      .motion_estimator
+      .ransac(
+
+        params,
+
+        jsfeat.homography2d,
+
+        patternXY,
+
+        screenXY,
+
+        count,
+
+        trace.homo3x3,
+
+        trace.matchMask,
+
+        700
+
+      );
+
+  if (!ok) {
+
+    jsfeat.matmath
+      .identity_3x3(
+
+        trace.homo3x3,
+
+        1.0
+
+      );
+
+    return 0;
+  }
+
+  let good = 0;
+
+  for (
+    let i = 0;
+    i < count;
+    i++
   ) {
 
     if (
-      !audioContext ||
-      !trace.audioBuffer ||
+      trace.matchMask
+        .data[i]
+    ) {
+
+      patternXY[
+        good
+      ] =
+        patternXY[i];
+
+      screenXY[
+        good
+      ] =
+        screenXY[i];
+
+      good++;
+    }
+  }
+
+  if (
+    good >= 4
+  ) {
+
+    jsfeat
+      .homography2d
+      .run(
+
+        patternXY,
+
+        screenXY,
+
+        trace.homo3x3,
+
+        good
+      );
+  }
+
+  return good;
+}
+
+function chooseWinner(
+  readings
+) {
+
+  const eligible =
+    readings.filter(
+      (r) =>
+
+        r.trace.ready &&
+
+        r.trace.id !==
+          blockedTraceId &&
+
+        r.goodMatches >=
+          r.trace.threshold
+    );
+
+  if (
+    !eligible.length
+  ) {
+
+    return null;
+  }
+
+  eligible.sort(
+    (a, b) => {
+
+      const aScore =
+        a.goodMatches /
+        Math.max(
+          1,
+          a.trace.threshold
+        );
+
+      const bScore =
+        b.goodMatches /
+        Math.max(
+          1,
+          b.trace.threshold
+        );
+
+      if (
+        bScore !==
+        aScore
+      ) {
+
+        return (
+          bScore -
+          aScore
+        );
+      }
+
+      return (
+        b.goodMatches -
+        a.goodMatches
+      );
+    }
+  );
+
+  return eligible[0];
+}
+
+function updateBlockedTrace(
+  readings
+) {
+
+  if (
+    blockedTraceId ==
+    null
+  ) {
+
+    return;
+  }
+
+  const reading =
+    readings.find(
+      (r) =>
+        r.trace.id ===
+        blockedTraceId
+    );
+
+  if (!reading) {
+
+    blockedTraceId =
+      null;
+
+    blockedClearFrames =
+      0;
+
+    return;
+  }
+
+  const clearLevel =
+    Math.max(
+
+      4,
+
+      Math.floor(
+        reading.trace
+          .threshold *
+        0.6
+      )
+    );
+
+  if (
+    reading.goodMatches <
+    clearLevel
+  ) {
+
+    blockedClearFrames +=
+      1;
+
+    if (
+      blockedClearFrames >=
+      3
+    ) {
+
+      blockedTraceId =
+        null;
+
+      blockedClearFrames =
+        0;
+    }
+
+  } else {
+
+    blockedClearFrames =
+      0;
+  }
+}
+
+function playTraceSound(
+  trace
+) {
+
+  if (
+
+    !audioContext ||
+
+    !trace.audioBuffer ||
+
+    isAudioPlaying
+
+  ) {
+
+    return;
+  }
+
+  const source =
+    audioContext
+      .createBufferSource();
+
+  source.buffer =
+    trace.audioBuffer;
+
+  source.connect(
+    audioContext.destination
+  );
+
+  isAudioPlaying =
+    true;
+
+  currentSource =
+    source;
+
+  blockedTraceId =
+    trace.id;
+
+  blockedClearFrames =
+    0;
+
+  cameraBox.classList
+    .add(
+      'found'
+    );
+
+  foundBadge.textContent =
+    `TRACE ${trace.id} FOUND`;
+
+  setStatus(
+
+    `TRACE ${trace.id} FOUND — SOUND PLAYING`,
+
+    'When the sound ends, scanning resumes automatically.'
+
+  );
+
+  source.onended =
+    () => {
+
+      if (
+        currentSource !==
+        source
+      ) {
+
+        return;
+      }
+
+      currentSource =
+        null;
+
+      isAudioPlaying =
+        false;
+
+      cameraBox.classList
+        .remove(
+          'found'
+        );
+
+      setStatus(
+
+        'SCANNING…',
+
+        `Ready for any trace. Move away briefly before replaying Trace ${trace.id}.`
+
+      );
+    };
+
+  source.start(0);
+}
+
+function processFrame() {
+
+  if (
+
+    processing ||
+
+    !stream ||
+
+    video.readyState < 2 ||
+
+    !jsfeat
+
+  ) {
+
+    return;
+  }
+
+  processing =
+    true;
+
+  try {
+
+    drawVideoCover();
+
+    if (
       isAudioPlaying
     ) {
 
       return;
     }
 
-    const source =
-      audioContext
-        .createBufferSource();
-
-    source.buffer =
-      trace.audioBuffer;
-
-    source.connect(
-      audioContext.destination
-    );
-
-    isAudioPlaying =
-      true;
-
-    currentSource =
-      source;
-
-    blockedTraceId =
-      trace.id;
-
-    blockedClearFrames =
-      0;
-
-    cameraBox.classList
-      .add(
-        'found'
+    const imageData =
+      ctx.getImageData(
+        0,
+        0,
+        W,
+        H
       );
 
-    foundBadge.textContent =
-      `TRACE ${trace.id} FOUND`;
+    jsfeat.imgproc
+      .grayscale(
 
-    setStatus(
-      `TRACE ${trace.id} FOUND — SOUND PLAYING`,
-      'Recognition pauses until this sound ends.'
-    );
+        imageData.data,
 
-    source.onended =
-      () => {
+        W,
+        H,
 
-        if (
-          currentSource !==
-          source
-        ) {
-
-          return;
-        }
-
-        currentSource =
-          null;
-
-        isAudioPlaying =
-          false;
-
-        cameraBox.classList
-          .remove(
-            'found'
-          );
-
-        setStatus(
-          'SCANNING…',
-          `Ready for the next trace. Trace ${trace.id} will re-arm after you move away from it.`
-        );
-      };
-
-    source.start(0);
-  }
-
-  function updateBlockedTrace(
-    readings
-  ) {
-
-    if (
-      blockedTraceId ==
-      null
-    ) {
-
-      return;
-    }
-
-    const reading =
-      readings.find(
-        (item) =>
-          item.id ===
-          blockedTraceId
+        imgU8
       );
 
-    if (!reading) {
+    jsfeat.imgproc
+      .gaussian_blur(
 
-      blockedTraceId =
-        null;
+        imgU8,
 
-      blockedClearFrames =
-        0;
+        imgSmooth,
 
-      return;
-    }
+        5
+      );
 
-    const result =
-      shouldReleaseBlockedTrace({
+    const numCorners =
+      detectKeypoints(
 
-        goodMatches:
-          reading.goodMatches,
+        imgSmooth,
 
-        threshold:
-          reading.threshold,
+        screenCorners,
 
-        clearFrames:
-          blockedClearFrames
+        MAX_SCREEN_POINTS
+      );
 
-      });
+    jsfeat.orb.describe(
 
-    blockedClearFrames =
-      result.clearFrames;
+      imgSmooth,
 
-    if (
-      result.release
+      screenCorners,
+
+      numCorners,
+
+      screenDescriptors
+    );
+
+    const readings =
+      [];
+
+    for (
+      const trace
+      of traces
     ) {
-
-      blockedTraceId =
-        null;
-
-      blockedClearFrames =
-        0;
-    }
-  }
-
-  function processFrame() {
-
-    if (
-      processing ||
-      !stream ||
-      video.readyState < 2 ||
-      !jsfeat
-    ) {
-
-      return;
-    }
-
-    processing =
-      true;
-
-    try {
-
-      drawVideoCover();
 
       if (
-        isAudioPlaying
+        !trace.imageReady
       ) {
-
-        return;
-      }
-
-      const imageData =
-        ctx.getImageData(
-          0,
-          0,
-          W,
-          H
-        );
-
-      jsfeat.imgproc
-        .grayscale(
-          imageData.data,
-          W,
-          H,
-          imgU8
-        );
-
-      jsfeat.imgproc
-        .gaussian_blur(
-          imgU8,
-          imgSmooth,
-          5
-        );
-
-      const numCorners =
-        detectKeypoints(
-          imgSmooth,
-          screenCorners,
-          MAX_SCREEN_POINTS
-        );
-
-      jsfeat.orb.describe(
-        imgSmooth,
-        screenCorners,
-        numCorners,
-        screenDescriptors
-      );
-
-      const readings = [];
-
-      for (
-        const trace
-        of traces
-      ) {
-
-        if (
-          !trace.imageReady
-        ) {
-
-          trace.lastGoodMatches =
-            0;
-
-          trace.lastCandidateMatches =
-            0;
-
-          readings.push({
-
-            id:
-              trace.id,
-
-            ready:
-              false,
-
-            goodMatches:
-              0,
-
-            candidateMatches:
-              0,
-
-            threshold:
-              traceThreshold(
-                trace
-              ),
-
-            trace
-
-          });
-
-          continue;
-        }
-
-        const candidateMatches =
-          matchPattern(
-            trace
-          );
-
-        const goodMatches =
-          findTransform(
-            trace,
-            candidateMatches
-          );
-
-        trace.lastCandidateMatches =
-          candidateMatches;
 
         trace.lastGoodMatches =
-          goodMatches;
+          0;
+
+        trace.lastCandidateMatches =
+          0;
 
         readings.push({
 
-          id:
-            trace.id,
+          trace,
 
-          ready:
-            traceIsReady(
-              trace
-            ),
+          goodMatches:
+            0,
 
-          goodMatches,
-
-          candidateMatches,
-
-          threshold:
-            traceThreshold(
-              trace
-            ),
-
-          trace
+          candidateMatches:
+            0
 
         });
+
+        continue;
       }
 
-      updateBlockedTrace(
+      const candidateMatches =
+        matchPattern(
+          trace
+        );
+
+      const goodMatches =
+        findTransform(
+          trace,
+          candidateMatches
+        );
+
+      trace.lastCandidateMatches =
+        candidateMatches;
+
+      trace.lastGoodMatches =
+        goodMatches;
+
+      readings.push({
+
+        trace,
+
+        goodMatches,
+
+        candidateMatches
+
+      });
+    }
+
+    updateBlockedTrace(
+      readings
+    );
+
+    updateLiveReadings();
+
+    const winner =
+      chooseWinner(
         readings
       );
 
-      updateLiveReadings();
-
-      const winner =
-        chooseWinningTrace(
-          readings,
-          blockedTraceId
-        );
-
-      if (winner) {
-
-        cameraBox.classList
-          .add(
-            'found'
-          );
-
-        foundBadge.textContent =
-          `TRACE ${winner.id} FOUND`;
-
-        drawDetectedShape(
-          winner.trace
-        );
-
-        playTraceSound(
-          winner.trace
-        );
-
-      } else {
-
-        cameraBox.classList
-          .remove(
-            'found'
-          );
-
-        foundBadge.textContent =
-          'TRACE FOUND';
-
-        if (
-          blockedTraceId ==
-          null
-        ) {
-
-          setStatus(
-            'SCANNING…',
-            'Point the camera at one of the prepared traces.'
-          );
-
-        } else {
-
-          setStatus(
-            'SCANNING…',
-            `Trace ${blockedTraceId} is temporarily blocked until you move away from it.`
-          );
-        }
-      }
-
-    } catch (err) {
-
-      console.error(
-        err
-      );
-
-      setStatus(
-        'Recognition stopped because of an error.',
-        'Reload the page and try again.'
-      );
-
-      stopCamera();
-
-    } finally {
-
-      processing =
-        false;
-    }
-  }
-
-  async function startCamera() {
-
     if (
-      !navigator.mediaDevices
-        ?.getUserMedia
+      winner
     ) {
 
-      setStatus(
-        'Camera access is not available.',
-        'Open this page from an HTTPS address such as GitHub Pages.'
+      playTraceSound(
+        winner.trace
       );
 
-      return;
-    }
+    } else {
 
-    if (
-      readyCount() === 0
-    ) {
-
-      setStatus(
-        'Prepare at least one complete trace + sound pair first.'
-      );
-
-      return;
-    }
-
-    try {
-
-      audioContext ||=
-        new (
-          window.AudioContext ||
-          window.webkitAudioContext
-        )();
-
-      await audioContext
-        .resume();
-
-      stream =
-        await navigator
-          .mediaDevices
-          .getUserMedia({
-
-            audio:
-              false,
-
-            video: {
-
-              facingMode: {
-                ideal:
-                  'environment'
-              },
-
-              width: {
-                ideal:
-                  1280
-              },
-
-              height: {
-                ideal:
-                  960
-              }
-
-            }
-
-          });
-
-      video.srcObject =
-        stream;
-
-      await video.play();
-
-      blockedTraceId =
-        null;
-
-      blockedClearFrames =
-        0;
-
-      isAudioPlaying =
-        false;
-
-      startBtn.style.display =
-        'none';
-
-      stopBtn.style.display =
-        'block';
+      cameraBox.classList
+        .remove(
+          'found'
+        );
 
       setStatus(
+
         'SCANNING…',
-        'Point the camera at one of the prepared traces.'
-      );
 
-      timer =
-        window.setInterval(
-          processFrame,
-          FRAME_INTERVAL_MS
-        );
+        blockedTraceId == null
 
-    } catch (err) {
+          ? 'Point the camera at any prepared trace.'
 
-      console.error(
-        err
-      );
+          : `Trace ${blockedTraceId} can replay after you move away briefly.`
 
-      setStatus(
-        'Camera could not start.',
-        'Allow camera permission, then try again.'
       );
     }
+
+  } catch (err) {
+
+    console.error(err);
+
+    setStatus(
+
+      'Recognition stopped because of an error.',
+
+      'Reload the page and try again.'
+
+    );
+
+    stopCamera();
+
+  } finally {
+
+    processing =
+      false;
+  }
+}
+
+async function startCamera() {
+
+  if (
+    !navigator
+      .mediaDevices
+      ?.getUserMedia
+  ) {
+
+    setStatus(
+
+      'Camera access is not available.',
+
+      'Open this page from the HTTPS GitHub Pages link.'
+
+    );
+
+    return;
   }
 
-  function stopCamera() {
+  if (
+    !traces.some(
+      (t) => t.ready
+    )
+  ) {
 
-    if (timer) {
+    setStatus(
 
-      window.clearInterval(
-        timer
-      );
-    }
+      'No trace is ready.',
 
-    timer =
-      null;
+      'Check the trace and sound files in GitHub.'
 
-    if (
-      currentSource
-    ) {
+    );
 
-      currentSource.onended =
-        null;
+    return;
+  }
 
-      try {
+  try {
 
-        currentSource.stop();
+    audioContext ||=
+      new (
+        window.AudioContext ||
+        window.webkitAudioContext
+      )();
 
-      } catch (_) {}
-    }
+    await audioContext
+      .resume();
 
-    currentSource =
-      null;
+    stream =
+      await navigator
+        .mediaDevices
+        .getUserMedia({
 
-    isAudioPlaying =
-      false;
+          audio:
+            false,
+
+          video: {
+
+            facingMode: {
+              ideal:
+                'environment'
+            },
+
+            width: {
+              ideal:
+                1280
+            },
+
+            height: {
+              ideal:
+                960
+            }
+          }
+
+        });
+
+    video.srcObject =
+      stream;
+
+    await video.play();
 
     blockedTraceId =
       null;
@@ -2378,55 +2785,156 @@ function initApp() {
     blockedClearFrames =
       0;
 
-    stream
-      ?.getTracks()
-      .forEach(
-        (track) =>
-          track.stop()
-      );
-
-    stream =
-      null;
-
-    video.srcObject =
-      null;
-
-    processing =
+    isAudioPlaying =
       false;
 
-    cameraBox.classList
-      .remove(
-        'found'
-      );
-
-    foundBadge.textContent =
-      'TRACE FOUND';
-
     startBtn.style.display =
-      'block';
-
-    stopBtn.style.display =
       'none';
 
+    stopBtn.style.display =
+      'block';
+
     setStatus(
-      'Stopped. Press START when ready.'
+
+      'SCANNING…',
+
+      'Point the camera at any prepared trace.'
+
+    );
+
+    timer =
+      window.setInterval(
+
+        processFrame,
+
+        FRAME_INTERVAL_MS
+
+      );
+
+  } catch (err) {
+
+    console.error(err);
+
+    setStatus(
+
+      'Camera could not start.',
+
+      'Allow camera permission, then try again.'
+
+    );
+  }
+}
+
+function stopCamera() {
+
+  if (timer) {
+
+    window.clearInterval(
+      timer
     );
   }
 
-  startBtn.addEventListener(
-    'click',
-    startCamera
-  );
+  timer =
+    null;
 
-  stopBtn.addEventListener(
-    'click',
-    stopCamera
-  );
+  if (
+    currentSource
+  ) {
 
-  window.addEventListener(
-    'pagehide',
-    stopCamera
+    currentSource.onended =
+      null;
+
+    try {
+
+      currentSource.stop();
+
+    } catch (_) {}
+  }
+
+  currentSource =
+    null;
+
+  isAudioPlaying =
+    false;
+
+  blockedTraceId =
+    null;
+
+  blockedClearFrames =
+    0;
+
+  stream
+    ?.getTracks()
+    .forEach(
+      (track) =>
+        track.stop()
+    );
+
+  stream =
+    null;
+
+  video.srcObject =
+    null;
+
+  processing =
+    false;
+
+  cameraBox.classList
+    .remove(
+      'found'
+    );
+
+  foundBadge.textContent =
+    'TRACE FOUND';
+
+  startBtn.style.display =
+    'block';
+
+  stopBtn.style.display =
+    'none';
+
+  setStatus(
+
+    'Stopped. Press START when ready.'
+
   );
+}
+
+startBtn.addEventListener(
+  'click',
+  startCamera
+);
+
+stopBtn.addEventListener(
+  'click',
+  stopCamera
+);
+
+window.addEventListener(
+  'pagehide',
+  stopCamera
+);
+
+async function init() {
+
+  updateExposureLabel();
+
+  if (
+    AUDIENCE_MODE
+  ) {
+
+    document
+      .querySelector(
+        '.sub'
+      )
+      .textContent =
+
+      'Press START, then point the camera at any trace. You can return to any trace again after its sound ends.';
+  }
 
   initVision();
+
+  await loadAllAssets();
 }
+
+init();
